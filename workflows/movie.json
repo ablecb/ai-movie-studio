@@ -1,0 +1,72 @@
+{
+  "name": "专业级 AI 电影标准流程",
+  "brief": "一部 3 分钟科幻短片：深空信使收到来自地球麦田的神秘信号，踏上归途。",
+  "stages": [
+    {
+      "id": "script",
+      "skill": "script",
+      "params": { "title": "剧本创作", "duration_min": "3", "style": "电影感胶片质感，2.39:1" },
+      "retries": 2
+    },
+    {
+      "id": "characters",
+      "skill": "characters",
+      "depends_on": ["script"],
+      "params": {
+        "title": "角色圣经（一致性地基）",
+        "voice_pool": ["tongtong", "chuichui", "xiaochen", "jam"]
+      },
+      "retries": 2
+    },
+    {
+      "id": "storyboard",
+      "skill": "storyboard",
+      "depends_on": ["script", "characters"],
+      "params": { "title": "分镜设计", "duration_min": "3" },
+      "retries": 2
+    },
+    {
+      "id": "voiceover",
+      "skill": "voiceover",
+      "depends_on": ["script", "storyboard", "characters"],
+      "params": { "title": "配音台本（台词唯一真源）" },
+      "retries": 2
+    },
+    {
+      "id": "shotspec",
+      "skill": "shotspec",
+      "depends_on": ["storyboard", "characters", "voiceover", "script"],
+      "params": { "title": "生成规格（镜头/照明/台词绑定）" },
+      "retries": 2
+    },
+    {
+      "id": "music",
+      "skill": "music",
+      "depends_on": ["script", "storyboard"],
+      "params": { "title": "音乐音效方案" },
+      "retries": 2
+    },
+    {
+      "id": "subtitles",
+      "skill": "subtitles",
+      "depends_on": ["storyboard", "voiceover"],
+      "params": { "title": "字幕计划稿（渲染后按实测重排）" },
+      "retries": 2
+    },
+    {
+      "id": "editplan",
+      "skill": "editplan",
+      "depends_on": ["storyboard", "shotspec"],
+      "params": { "title": "剪辑与渲染方案" },
+      "retries": 2
+    },
+    {
+      "id": "review",
+      "skill": "review",
+      "depends_on": ["script", "storyboard", "shotspec", "voiceover", "music"],
+      "params": { "title": "AI 制片人审片", "threshold": 8.5, "target": "storyboard" },
+      "retries": 2,
+      "max_revisions": 2
+    }
+  ]
+}

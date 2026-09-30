@@ -1,0 +1,241 @@
+{
+  "style": {
+    "name": "international poetic realism",
+    "aspect": "2.39:1",
+    "camera": {
+      "name": "ARRI Alexa 65",
+      "format": "large format digital negative",
+      "texture": "extremely gentle highlight rolloff, sky never clips to white, deep retained shadow detail at night",
+      "mount": "",
+      "film_stock": "Kodak Vision3 500T emulation for night"
+    },
+    "grade": {
+      "palette": "harvest night is orange machinery lamps against a lifted near-black blue sky; skin tones desaturated, no HDR glow",
+      "contrast": "filmic S-curve with fully retained shadow detail, black sky kept slightly lifted so wind motion stays readable",
+      "grain": "fine 35mm grain, marginally coarser on high-wind exterior shots",
+      "halation": "visible halation around combine headlamps only",
+      "lut": ""
+    },
+    "photoreal": [
+      "photorealistic live-action film still, shot on a real cinema camera",
+      "authentic skin texture with visible pores, fine facial hair and natural subsurface scattering",
+      "real fabric weave, visible seams, natural wear and creases in wardrobe",
+      "motivated practical light sources visible in frame",
+      "shallow depth of field with organic bokeh, some foreground occlusion",
+      "subtle film grain, gentle halation around highlights, natural highlight rolloff",
+      "slightly imperfect framing and focus like a real camera operator",
+      "true-to-life color science, desaturated skin tones, no HDR glow",
+      "rural north China plain at night, dust and chaff suspended in the air, no set dressing gloss, no CGI sheen"
+    ],
+    "time_of_day": "麦收夜 / harvest night",
+    "locations": [
+      "华北平原麦田与田埂",
+      "收割后的麦田"
+    ],
+    "score": "no music at all; only wind, diesel engines, wheat stalks"
+  },
+  "shots": [
+    {
+      "id": "sw001",
+      "scene_id": "u1",
+      "location": "华北平原 · 麦田",
+      "time_of_day": "夜",
+      "description": "大远景：夜里的麦田，风把整片麦浪按下去，画面里没有一个人",
+      "action_en": "extreme wide shot of an immense wheat field at night, wind pressing the entire expanse of standing wheat down in one slow travelling wave from the far left toward camera, no figures, no moon, a faint lifted dark blue sky above a low horizon, chaff drifting in the air",
+      "shot_size": "大远景",
+      "shot_size_en": "extreme wide establishing shot, vast scale, tiny human figure",
+      "camera_move": "固定",
+      "camera_move_en": "locked-off tripod, completely static frame, no camera movement",
+      "lens": { "mm": 24, "t_stop": "T2.8", "character": "modern wide-angle cinema glass", "dof": "deep focus with distant detail", "flare": "clean", "sort_key": 24 },
+      "light": { "key": "no practical source at all; only the last blue residue of dusk and starlight", "quality": "ambient, extremely low", "direction": "top, from the sky", "color_temp": 9000, "ratio": "20:1 near-dark", "practical": "none" },
+      "composition": { "frame": "horizon on the lower third, the wheat field filling the bottom, a large empty dark sky above", "subject_pos": "no subject — the travelling wave of wheat is the subject", "headroom": "n/a — no faces in frame", "negative_space": "the upper two thirds is empty dark sky, held deliberately for the opening title" },
+      "duration_sec": 5,
+      "characters": [],
+      "beats": [
+        { "kind": "action", "speaker": "", "text": "风把整片麦子按下去，又抬起来。", "at_sec": 1.5, "emotion": "大地是活的" }
+      ],
+      "emotion": "辽阔、不安",
+      "continuity": "全片第一镜。天占三分之二的构图纪律在这里定下。本片唯一一次出现空白天空留给片名。",
+      "dialogue_sec": 0,
+      "seed": 310101,
+      "risk": "low",
+      "priority": 1
+    },
+    {
+      "id": "sw002",
+      "scene_id": "u1",
+      "location": "华北平原 · 地平线",
+      "time_of_day": "夜",
+      "description": "大远景：收割机车队从地平线上升起，排成一列，灯光扫过麦浪，雾里有一道人影",
+      "action_en": "extreme wide night shot looking along a harvested lane through standing wheat as a long line of combine harvesters stretches back toward the horizon, their warm tungsten lamps flaring in low ground mist and casting long radial shadows across the stubble, one small distant human silhouette standing at the far left edge of the field",
+      "shot_size": "大远景",
+      "shot_size_en": "extreme wide establishing shot, vast scale, tiny human figure",
+      "camera_move": "固定",
+      "camera_move_en": "locked-off tripod, completely static frame, no camera movement",
+      "lens": { "mm": 24, "t_stop": "T2.8", "character": "modern wide-angle cinema glass", "dof": "deep focus with distant detail", "flare": "clean", "sort_key": 24 },
+      "light": { "key": "a receding line of combine harvester headlamp arrays, warm tungsten, flaring in ground mist", "quality": "hard, multiple, warm, flaring", "direction": "from the horizon toward camera, raking across the stubble", "color_temp": 2800, "ratio": "30:1 — lamps against black", "practical": "the combine headlamps themselves, visible in frame" },
+      "composition": { "frame": "the machine line running diagonally from the right foreground to the horizon on the left third, a tiny figure at the extreme left edge", "subject_pos": "the machine line occupying the centre and right, the human figure on the far left third", "headroom": "n/a — the figure is a silhouette at distance", "negative_space": "the dark misty sky above the lamps" },
+      "duration_sec": 5,
+      "characters": ["李秀云"],
+      "beats": [
+        { "kind": "action", "speaker": "", "text": "一个一个从地平线下面升起来。排成一列。", "at_sec": 1.5, "emotion": "这不是农机，这是舰队" }
+      ],
+      "emotion": "壮阔、压迫",
+      "continuity": "全片最重要的场面镜。灯必须是一列、有纵深、在雾里形成光晕与放射状阴影。人影只作剪影，不给正脸。",
+      "dialogue_sec": 0,
+      "seed": 310102,
+      "risk": "high",
+      "priority": 1
+    },
+    {
+      "id": "sw003",
+      "scene_id": "u1",
+      "location": "华北平原 · 田埂",
+      "time_of_day": "夜",
+      "description": "全景：两盏探照灯同时转到她身上，把她的背影从黑暗里捞出来照得发白，又转走",
+      "action_en": "full shot from behind of a woman standing on a raised earth path between wheat fields at night as two combine harvester searchlights swing onto her at once, blowing her dark jacket to near-white and throwing her long shadow forward into the crop, the beams then sweeping away and dropping her back into total darkness",
+      "shot_size": "全景",
+      "shot_size_en": "full shot, whole body head to toe with headroom",
+      "camera_move": "固定",
+      "camera_move_en": "locked-off tripod, completely static frame, no camera movement",
+      "lens": { "mm": 40, "t_stop": "T2.0", "character": "spherical prime", "dof": "subject separated from background", "flare": "slight", "sort_key": 40 },
+      "light": { "key": "two combine harvester searchlights swinging onto the subject from behind camera-left", "quality": "hard, blinding, moving", "direction": "camera-left, from behind, raking across", "color_temp": 2800, "ratio": "2:1 when lit, then 40:1 after the lamps leave", "practical": "the two searchlights themselves, entering frame" },
+      "composition": { "frame": "subject centred on the path, back to camera, the two beams entering from the left edge", "subject_pos": "subject centred, back to camera", "headroom": "generous headroom, no crop on face or hands", "negative_space": "total black on either side of the beam" },
+      "duration_sec": 5,
+      "characters": ["李秀云"],
+      "beats": [
+        { "kind": "action", "speaker": "", "text": "灯转过来，把她照得发白。", "at_sec": 1.5, "emotion": "被看见，但只有两秒" },
+        { "kind": "action", "speaker": "", "text": "灯转走了。她又被还回黑暗里。", "at_sec": 3.5, "emotion": "这才是她的位置" }
+      ],
+      "emotion": "被短暂照亮的人",
+      "continuity": "【本片的题眼】。被照亮、又被还回黑暗。全片最后一镜将重复这个节奏。必须背对镜头——本片主角永不给正脸近景。",
+      "dialogue_sec": 0,
+      "seed": 310103,
+      "risk": "high",
+      "priority": 1
+    },
+    {
+      "id": "sw004",
+      "scene_id": "u1",
+      "location": "华北平原 · 收割后的麦田",
+      "time_of_day": "夜",
+      "description": "近景：她蹲在收割过的地里，伸手按住一把麦茬——风想把它吹走，她压着",
+      "action_en": "medium close-up of a woman crouched low in a cut wheat field at night, one large weathered hand pressed flat down on a clump of stubble as the wind tries to tear it loose, thick knuckles and nails cut to the flesh, her face turned away and lost in darkness, only the faint sky above the horizon line",
+      "shot_size": "近景",
+      "shot_size_en": "medium close-up, chest up",
+      "camera_move": "固定",
+      "camera_move_en": "locked-off tripod, completely static frame, no camera movement",
+      "lens": { "mm": 100, "t_stop": "T1.8", "character": "fast portrait prime", "dof": "very shallow, creamy background falloff", "flare": "controlled", "sort_key": 100 },
+      "light": { "key": "no lamp; only the faint lifted night sky from behind, the hand nearly lost in darkness", "quality": "ambient, extremely low", "direction": "top and behind, from the sky", "color_temp": 8000, "ratio": "16:1", "practical": "none" },
+      "composition": { "frame": "the hand and stubble in the lower third, the subject's back and shoulder above in soft darkness", "subject_pos": "the hand centred in the lower third", "headroom": "normal headroom, no crop on face or hands", "negative_space": "darkness holds the upper frame" },
+      "duration_sec": 5,
+      "characters": ["李秀云"],
+      "beats": [
+        { "kind": "action", "speaker": "", "text": "风想把它吹走。她压着。", "at_sec": 1.5, "emotion": "一个人对一整片平原的抵抗" }
+      ],
+      "emotion": "无望的按住",
+      "continuity": "【本片形式骨架动作：蹲下压住被风掀起的东西】。此动作在全片五地各出现一次。不给正脸。",
+      "dialogue_sec": 0,
+      "seed": 310104,
+      "risk": "high",
+      "priority": 2
+    },
+    {
+      "id": "sw005",
+      "scene_id": "u1",
+      "location": "农户院落 · 院门口",
+      "time_of_day": "夜",
+      "description": "中景：她把睡着的小孩用旧棉被裹好放进拖拉机后斗；风把脖子上的红布条吹起来，她塞进衣领",
+      "action_en": "medium shot in a dark farmyard at night as a woman lays a sleeping child wrapped in a worn quilt into the trailer of a small tractor, one bare wall bulb lighting her from the side, then a faded red cloth strip knotted at her throat lifts in the wind and she tucks it in under her collar with one hand",
+      "shot_size": "中景",
+      "shot_size_en": "medium shot, waist up",
+      "camera_move": "固定",
+      "camera_move_en": "locked-off tripod, completely static frame, no camera movement",
+      "lens": { "mm": 40, "t_stop": "T2.0", "character": "spherical prime", "dof": "subject separated from background", "flare": "slight", "sort_key": 40 },
+      "light": { "key": "a single bare wall bulb in the yard, hard and small, with faint kitchen light through a window", "quality": "hard, small, side", "direction": "camera-right, from the wall", "color_temp": 2900, "ratio": "7:1", "practical": "the bare yard bulb visible on the wall in frame" },
+      "composition": { "frame": "tractor trailer on the left third, the woman on the right third, dark yard behind", "subject_pos": "subject on the right third, in near-profile with her face turned down toward the child", "headroom": "normal headroom, no crop on face or hands", "negative_space": "the black yard opening between them" },
+      "duration_sec": 5,
+      "characters": ["李秀云"],
+      "beats": [
+        { "kind": "action", "speaker": "", "text": "她把小孩裹好，放进后斗。", "at_sec": 1.5, "emotion": "熟练，像打包一件行李" },
+        { "kind": "action", "speaker": "", "text": "红布条被风吹起来。她把它塞进衣领。", "at_sec": 3.5, "emotion": "全片唯一一件她带走的旧东西" }
+      ],
+      "emotion": "把家折叠起来带走",
+      "continuity": "【红布条是全片唯一的情感道具】，颜色必须褪到灰白，不是鲜红。孩子只给裹在被子里的形体，不给正脸。",
+      "dialogue_sec": 0,
+      "seed": 310105,
+      "risk": "medium",
+      "priority": 2
+    },
+    {
+      "id": "sw006",
+      "scene_id": "u1",
+      "location": "柏油路",
+      "time_of_day": "拂晓前",
+      "description": "大特写：后视镜里，村子的灯一点一点退下去，最后剩下一颗，然后是零",
+      "action_en": "extreme close-up of a small cracked tractor side mirror at pre-dawn reflecting a receding line of village window lights across dark fields, the lamps shrinking one by one until a single point remains and then goes out, the driver's face deliberately out of frame",
+      "shot_size": "大特写",
+      "shot_size_en": "extreme close-up on a single detail, very shallow focus",
+      "camera_move": "固定",
+      "camera_move_en": "locked-off tripod, completely static frame, no camera movement",
+      "lens": { "mm": 100, "t_stop": "T2.0", "character": "macro-capable prime", "dof": "extreme shallow focus on one detail", "flare": "mild", "sort_key": 100 },
+      "light": { "key": "distant village window lamps reflected in the mirror glass, plus the first grey of pre-dawn sky", "quality": "tiny warm point sources against cold ambient grey", "direction": "from behind, reflected", "color_temp": 2900, "ratio": "14:1", "practical": "the reflected village lamps are the only warm light" },
+      "composition": { "frame": "the mirror filling the left two thirds, black road and pre-dawn sky in the right third", "subject_pos": "the mirror on the left third, no face in frame", "headroom": "n/a — mirror only, the driver's face deliberately excluded", "negative_space": "the empty pre-dawn road in the right third" },
+      "duration_sec": 5,
+      "characters": ["李秀云"],
+      "beats": [
+        { "kind": "action", "speaker": "", "text": "一点一点退下去。最后剩下一颗。", "at_sec": 1.5, "emotion": "倒数" },
+        { "kind": "action", "speaker": "", "text": "然后是零。", "at_sec": 3.5, "emotion": "家从画面里消失" }
+      ],
+      "emotion": "不可逆",
+      "continuity": "【第一场结尾】。此镜之后接字幕卡：北纬 43.2° 东经 76.9°。全片最后一镜将回到本镜的反向运动。",
+      "dialogue_sec": 0,
+      "seed": 310106,
+      "risk": "medium",
+      "priority": 1
+    }
+  ],
+  "characters": [
+    {
+      "name": "李秀云",
+      "token": "li-xiuyun-f38-north-china-farmer-windburned-plaid-shirt-red-cloth-strip-sickle-scar",
+      "age": "38 years old at the start of the film (born 1977)",
+      "ethnicity": "northern Han Chinese, rural",
+      "build": "163cm, broad-shouldered and strong from field and manual labour, hands notably large",
+      "hair": "black hair pulled back into a single bun tied with a plain black elastic band, strands always escaping into the wind",
+      "face": "wind-reddened cheeks, freckles across the cheekbones, faint untended eyebrows, thin cracked lower lip",
+      "skin": "coarse weathered skin, visible pores, fine lines at the temples and eye corners, a dark tan line on the forearms where the sleeves end",
+      "eyes": "single-lidded, a direct level gaze that narrows once when measuring a distance",
+      "distinctive": [
+        "an old sickle scar on the side of the right index finger",
+        "a faded red cloth strip knotted at the throat, worn to grey-pink, from the year her son was born",
+        "sleeves always rolled to the elbow"
+      ],
+      "wardrobe": "blue-and-white checked cotton shirt under a faded army-green work jacket, canvas shoes with mud on them",
+      "voice": "low, flat, extremely short sentences; she speaks eleven times in the entire film",
+      "tts_voice": "zh_female_mid_flat",
+      "ref_image": "",
+      "ref_seed": 3801977,
+      "emotion": "watchful, unsentimental, quietly stubborn"
+    },
+    {
+      "name": "儿子",
+      "token": "son-m5-north-china-sleeping-child-old-quilt-bare-arm",
+      "age": "5 years old",
+      "ethnicity": "northern Han Chinese, rural",
+      "build": "thin five-year-old boy, small for his age",
+      "hair": "short cropped black hair",
+      "face": "soft round child's face, eyes closed in sleep — never shown awake or in close-up",
+      "skin": "smooth child's skin with a faint chapped redness on the cheeks from cold",
+      "eyes": "closed throughout; he is never shown awake",
+      "distinctive": ["one bare arm always outside the quilt in sleep"],
+      "wardrobe": "a faded old cotton undershirt, wrapped in a worn quilt washed pale",
+      "voice": "no dialogue in the entire film",
+      "tts_voice": "",
+      "ref_image": "",
+      "ref_seed": 5202005,
+      "emotion": "unconscious, carried"
+    }
+  ],
+  "version": 2
+}

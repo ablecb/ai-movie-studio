@@ -1,0 +1,180 @@
+{
+  "base_url": "https://open.bigmodel.cn/api/paas/v4",
+  "api_key_env": "AI_API_KEY",
+  "mock": true,
+  "model": "glm-4.6",
+  "temperature": 0.8,
+  "max_tokens": 4096,
+  "models": {
+    "texture": "cogvideox-3",
+    "economy": "cogvideox-3",
+    "vision": "glm-5.3-flash",
+    "text": "glm-4.6",
+    "translate": "glm-4-flash",
+    "tts": "glm-tts"
+  },
+  "providers": {
+    "text": {
+      "base_url": "",
+      "api_key_env": ""
+    },
+    "vision": {
+      "base_url": "",
+      "api_key_env": ""
+    },
+    "image": {
+      "base_url": "",
+      "api_key_env": ""
+    },
+    "video": {
+      "base_url": "",
+      "api_key_env": ""
+    },
+    "tts": {
+      "base_url": "",
+      "api_key_env": ""
+    },
+    "image_edit": {
+      "base_url": "https://ark.cn-beijing.volces.com",
+      "api_key_env": "ARK_API_KEY",
+      "model": "doubao-seedream-4-0-250828"
+    },
+    "music": {
+      "base_url": "",
+      "api_key_env": "",
+      "model": ""
+    }
+  },
+  "vision_review": {
+    "enabled": true,
+    "sample_frames": 3,
+    "pass_score": 7.5,
+    "max_shots_per_request": 4,
+    "max_review_shots": 0,
+    "frame_width": 640
+  },
+  "pricing": {
+    "text": {
+      "prompt_per_1k_tokens": 0.001,
+      "completion_per_1k_tokens": 0.002
+    },
+    "vision": {
+      "prompt_per_1k_tokens": 0.004,
+      "completion_per_1k_tokens": 0.004
+    },
+    "translate": {
+      "prompt_per_1k_tokens": 0.0001,
+      "completion_per_1k_tokens": 0.0001
+    },
+    "image": {
+      "image_per_shot": 0.1
+    },
+    "video": {
+      "video_per_sec": 0.2
+    },
+    "tts": {
+      "tts_per_1k_chars": 0.1
+    },
+    "music": {
+      "music_per_call": 1.0
+    }
+  },
+  "budget": {
+    "max_cost_cny": 0,
+    "warn_ratio": 0.8,
+    "stop_on_no_fund": true
+  },
+  "video": {
+    "model": "cogvideox-3",
+    "quality_model": "cogvideox-3",
+    "economy_model": "cogvideox-3",
+    "default_quality": "quality",
+    "size": "1920x1080",
+    "fps": 30,
+    "workers": 2,
+    "timeout_minutes": 20,
+    "shot_retries": 3,
+    "rerender_rounds": 2,
+    "with_audio": false,
+    "fallback_models": [
+      "cogvideox-3",
+      "cogvideox"
+    ],
+    "image_to_image": true,
+    "ref_size": "1024x1024",
+    "watermark": false,
+    "allow_long_takes": true,
+    "chain_same_scene": true,
+    "reference_model": "vidu2-reference"
+  },
+  "image": {
+    "model": "glm-image",
+    "fallback_models": [
+      "glm-image",
+      "cogview-4"
+    ],
+    "size": "1248x704",
+    "ref_size": "1024x1024",
+    "quality": "",
+    "watermark": false
+  },
+  "quality": {
+    "min_sharpness": 55,
+    "min_mean_luma": 18,
+    "max_mean_luma": 238,
+    "min_std_luma": 14,
+    "max_face_ratio": 0.55,
+    "min_face_ratio": 0.02,
+    "max_subtitle_cps": 9.0,
+    "max_subtitle_line_runes": 18,
+    "max_subtitle_lines": 2,
+    "duration_tolerance": 0.35,
+    "max_cut_drift_sec": 1.5,
+    "loudness_target_lufs": -14.0,
+    "loudness_tolerance_lu": 1.5,
+    "true_peak_db": -1.0
+  },
+  "audio": {
+    "sample_rate": 48000,
+    "channels": 2,
+    "voice": "tongtong",
+    "voice_map": {},
+    "narrator_voice": "tongtong",
+    "bgm_gain_db": -18,
+    "duck_db": -9,
+    "sfx_gain_db": -14,
+    "max_speed_up": 1.15,
+    "tts_speed": 1.0,
+    "tts_emotion": true,
+    "tts_fallback_models": [
+      "cogtts"
+    ],
+    "line_gap_sec": 0.28,
+    "lead_in_sec": 0.18,
+    "target_loudness_lufs": -14
+  },
+  "transitions": {
+    "enabled": true,
+    "dissolve_sec": 0.6,
+    "fade_in_sec": 0.8,
+    "fade_out_sec": 1.0
+  },
+  "music": {
+    "library_dir": "library/music",
+    "generate": false
+  },
+  "subtitle": {
+    "font": "Source Han Sans SC Medium",
+    "font_size": 22,
+    "languages": [
+      "zh"
+    ],
+    "margin_v": 42,
+    "max_cps": 9.0,
+    "min_dur_sec": 0.9,
+    "burn_primary": false,
+    "max_line_runes": 18,
+    "max_lines": 2,
+    "outline_width": 2
+  }
+}

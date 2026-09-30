@@ -1,0 +1,18 @@
+{
+  "characters": [
+    {
+      "name": "李秀云",
+      "appearance": "38 岁北方农村汉族女性，身高 163cm，肩宽，长期体力劳动练出的结实身板，手掌明显偏大。黑发在脑后扎成一束，用一根普通黑色橡皮筋，总有几缕散出来被风吹到脸上。脸颊被风吹得偏红，颧骨上有雀斑，眉毛淡而不修，下唇常年起皮有裂口。皮肤粗糙、毛孔明显、额角与眼角有细纹；小臂上有清晰的晒痕分界，袖子以上白、以下黑。单眼皮，眼神平直，量距离时会眯一下。",
+      "wardrobe": "蓝白格子棉布衬衫外套一件褪色的军绿工装外套，袖口永远卷到肘上；脚上一双沾泥的解放鞋。脖子上系一条红布条，是儿子出生那年绑的，已经褪成灰粉色。",
+      "voice": "低、平，句子极短，全片只说 11 句话",
+      "consistency_tokens": "li-xiuyun-f38-north-china-farmer-windburned-plaid-shirt-red-cloth-strip-sickle-scar"
+    },
+    {
+      "name": "儿子",
+      "appearance": "5 岁北方农村男孩，瘦，短发，睡着时一只手常伸在被子外面。全片不给正脸、不给台词、不给他醒来的镜头。",
+      "wardrobe": "褪色的旧棉毛衫，睡觉时穿；被一条洗到起球的旧棉被裹着。",
+      "voice": "无台词",
+      "consistency_tokens": "son-m5-north-china-sleeping-child-bare-arm-old-quilt-broken-toy-rabbit"
+    }
+  ]
+}
