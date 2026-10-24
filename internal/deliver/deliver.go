@@ -476,11 +476,17 @@ func buildNarration(client *ai.Client, cfg *config.Config, opt Options, kit *pro
 	// 严格模式：供给过程本身的失败（生成/复制/落盘）直接失败；
 	// 曲库无匹配素材属于缺输入，逐条告警如实上报。
 	var musicWarns []string
-	warns, merr := ensureMusic(client, cfg, opt.RunDir)
+	warns, merr := ensureMusic(client, cfg, opt.RunDir, plan, kit)
 	if merr != nil {
 		return "", nil, nil, merr
 	}
 	for _, w := range warns {
+		fmt.Printf("  ⚠ %s\n", w)
+		musicWarns = append(musicWarns, w)
+	}
+	// 音效供给与配乐同级：曲库匹配 → 生成 API（此前 ensureSFX 从未被调用，
+	// sound_fx 清单"写完就扔"，成片永远是 0 音效轨）。
+	for _, w := range ensureSFX(client, cfg, opt.RunDir, plan) {
 		fmt.Printf("  ⚠ %s\n", w)
 		musicWarns = append(musicWarns, w)
 	}

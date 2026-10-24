@@ -30,6 +30,8 @@ type Config struct {
 	Temperature float64 `json:"temperature"`
 	MaxTokens   int     `json:"max_tokens"`
 	Mock        bool    `json:"mock"` // true 时启用离线演示模式
+	// AppID 二级凭据（双凭据供应商用，如火山语音的 appid；与 APIKey 配对）。
+	AppID string `json:"app_id,omitempty"`
 }
 
 // Key 解析本次调用要用的密钥。环境变量优先于本地配置文件，

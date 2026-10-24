@@ -196,7 +196,11 @@ type Audio struct {
 	Voice         string            `json:"voice"`     // 默认 TTS 音色
 	VoiceMap      map[string]string `json:"voice_map"` // 角色名 → 音色（取代关键词猜音调）
 	NarratorVoice string            `json:"narrator_voice"`
-	BGMGainDB     float64           `json:"bgm_gain_db"`
+	// SkipNarrator 全片关闭旁白/独白：配音只出角色对白（短剧对白驱动风格）。
+	// 过滤在合成入口完成，台词索引保持原序——对白句的缓存文件名不受影响，
+	// 已付费的合成资产照常复用。
+	SkipNarrator bool    `json:"skip_narrator,omitempty"`
+	BGMGainDB    float64 `json:"bgm_gain_db"`
 	// DuckDB 人声出现时 BGM 的压低量（dB，负值，典型 -9）。
 	//
 	// 实现说明：sidechaincompress 没有"压低 N dB"这样的直接参数，只有阈值与压缩比。
@@ -331,6 +335,10 @@ type Endpoint struct {
 	APIKeyLiteral string `json:"api_key"`
 	// Model 可选：覆盖该能力的模型名（视觉复核建议显式写，避免选到不支持视觉的模型）
 	Model string `json:"model,omitempty"`
+	// AppIDEnv/AppIDLiteral 二级凭据（双凭据供应商用，如火山语音的 appid +
+	// access token）。解析顺序与密钥一致：环境变量 > 本地层。
+	AppIDEnv     string `json:"appid_env,omitempty"`
+	AppIDLiteral string `json:"appid,omitempty"`
 }
 
 // VisionReview 视觉复核参数。
@@ -621,6 +629,12 @@ func (c *Config) APIKey() string {
 // APIKeyFor 解析指定能力的密钥，端点未指定环境变量时回落到顶层解析。
 func (c *Config) APIKeyFor(ep Endpoint) string {
 	if ep.APIKeyEnv == "" {
+		// 端点直填的本地层密钥优先于顶层——像 providers.music 指向豆包
+		// （与 TTS 共用一把 key 直填 api_key 字段）这种"单凭据独立端点"，
+		// 回落顶层会把智谱的 key 发给另一家（401 且账单错位）。
+		if v := strings.TrimSpace(ep.APIKeyLiteral); v != "" {
+			return v
+		}
 		return c.APIKey()
 	}
 	if v := os.Getenv(ep.APIKeyEnv); v != "" {
@@ -631,6 +645,15 @@ func (c *Config) APIKeyFor(ep Endpoint) string {
 		return c.APIKey()
 	}
 	return strings.TrimSpace(ep.APIKeyLiteral)
+}
+
+// AppIDFor 解析指定端点的二级凭据（appid）。双凭据供应商（火山语音等）用；
+// 解析顺序与密钥一致：环境变量 > 端点本地层。顶层无 appid 概念，不回落。
+func (c *Config) AppIDFor(ep Endpoint) string {
+	if v := os.Getenv(ep.AppIDEnv); v != "" {
+		return v
+	}
+	return strings.TrimSpace(ep.AppIDLiteral)
 }
 
 // normalize 补齐零值并做一致性校正，保证运行期不会出现"阈值为 0 导致全部误判"。

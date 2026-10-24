@@ -14,6 +14,8 @@ import (
 	"aistudio/internal/audio"
 	"aistudio/internal/config"
 	"aistudio/internal/fsx"
+	"aistudio/internal/narrate"
+	"aistudio/internal/promspec"
 	"aistudio/internal/shotkit"
 )
 
@@ -129,11 +131,41 @@ func pickMusicForCue(items []musicLibItem, mood, section, instruments string, wa
 //
 // 严格模式：生成调用失败/复制失败/落盘失败都是错误（直接中止交付）；
 // "曲库无匹配素材"是缺输入不是错误——如实上报为"该 cue 无配乐"。
-func ensureMusic(client *ai.Client, cfg *config.Config, runDir string) ([]string, error) {
-	plan := loadMusicPlan(runDir)
-	if len(plan.CueSheet) == 0 {
+// 电影里实际出现的场景集合：cue 对齐依赖场景跨度（scanMusicAndSFX 的
+// sceneSpanOf 语义），场景不在成片里 = cue 铺不上轨 = 生成纯浪费。
+func scenesInFilm(plan *narrate.Plan, kit *promspec.Kit) map[string]bool {
+	inFilm := map[string]bool{}
+	if plan == nil {
+		return inFilm
+	}
+	shotIn := map[string]bool{}
+	for _, s := range plan.Shots {
+		shotIn[s.ShotID] = true
+	}
+	if kit == nil {
+		return inFilm
+	}
+	firstOf := map[string]string{}
+	for _, sh := range kit.ShotList {
+		if _, seen := firstOf[sh.SceneID]; !seen {
+			firstOf[sh.SceneID] = sh.ID
+		}
+	}
+	for scene, first := range firstOf {
+		if shotIn[first] {
+			inFilm[scene] = true
+		}
+	}
+	return inFilm
+}
+
+func ensureMusic(client *ai.Client, cfg *config.Config, runDir string,
+	plan *narrate.Plan, kit *promspec.Kit) ([]string, error) {
+	musicPlan := loadMusicPlan(runDir)
+	if len(musicPlan.CueSheet) == 0 {
 		return nil, nil
 	}
+	inFilm := scenesInFilm(plan, kit)
 	musicDir := filepath.Join(runDir, "output", "music")
 	if err := os.MkdirAll(musicDir, 0o755); err != nil {
 		return nil, fmt.Errorf("BGM 自动化失败（无法创建目录 %s）: %w", musicDir, err)
@@ -145,33 +177,19 @@ func ensureMusic(client *ai.Client, cfg *config.Config, runDir string) ([]string
 
 	var lib []musicLibItem
 	var warnings []string
-	var musicClient *ai.Client
-	if cfg.Music.Generate {
-		ep := cfg.Providers.Music
-		if cfg.Mock {
-			// 离线演示：生成走占位音频（MusicGen 的 mock 通道），不校验端点
-			if client != nil && ep.BaseURL != "" && ep.Model != "" {
-				musicClient = client.For(ai.CapMusic, ai.Endpoint{
-					BaseURL: ep.BaseURL, APIKeyEnv: ep.APIKeyEnv,
-					APIKey: cfg.APIKeyFor(ep), Model: ep.Model,
-				})
-			}
-		} else {
-			// 严格模式：开启生成就必须配置完整且可用，不允许"配了等于没配"
-			if ep.BaseURL == "" || ep.Model == "" || client == nil {
-				return nil, fmt.Errorf("music.generate=true 但 providers.music 端点未配置完整（需要 base_url 与 model）")
-			}
-			mc, err := shotkit.CapClient(client, cfg, ai.CapMusic, ep, ep.Model)
-			if err != nil {
-				return nil, err
-			}
-			musicClient = mc
-		}
+	musicClient, err := musicGenClient(client, cfg)
+	if err != nil {
+		return nil, err
 	}
 
-	for i, cue := range plan.CueSheet {
+	for i, cue := range musicPlan.CueSheet {
 		if existing[cue.ID] || existing["cue"+pad2(i+1)] || existing[pad2(i+1)] {
 			continue // 已有素材（人工投喂或上次生成），不重复供给
+		}
+		// 场景不在成片里：cue 铺不上轨，不生成不告警。
+		// 无 scene_id 的 cue 例外——scanMusicAndSFX 对它退回顺序铺轨，仍可用。
+		if cue.SceneID != "" && !inFilm[cue.SceneID] {
+			continue
 		}
 		if len(lib) == 0 {
 			lib = loadMusicLibrary(cfg)
@@ -215,10 +233,19 @@ func ensureMusic(client *ai.Client, cfg *config.Config, runDir string) ([]string
 // 的文件名标签匹配（`雨_屋顶_循环.wav` ← "雨点打在铁皮屋顶上"），
 // 命中即复制为 output/sfx/<shot_id>.sfx.wav，混音链自动挂到对应镜头起点。
 // 此前音效清单是"写完就扔"的方案——SFX 只有在人工逐个丢文件时才会发声。
-func ensureSFX(cfg *config.Config, runDir string) []string {
-	plan := loadMusicPlan(runDir)
-	if len(plan.SoundFX) == 0 {
+// ensureSFX 音效供给：曲库匹配 → （可选）生成 API。
+// 只为**已渲染镜头**供给（plan.Shots 是实测槽位）——音效挂在镜头起点上，
+// 镜头不在成片里 = 音效铺不上轨，生成纯浪费；曲库命中复制零成本不受此限。
+func ensureSFX(client *ai.Client, cfg *config.Config, runDir string, plan *narrate.Plan) []string {
+	fxPlan := loadMusicPlan(runDir)
+	if len(fxPlan.SoundFX) == 0 {
 		return nil
+	}
+	shotIn := map[string]float64{} // shot_id → 实测时长（生成时长的依据）
+	if plan != nil {
+		for _, s := range plan.Shots {
+			shotIn[s.ShotID] = s.Duration
+		}
 	}
 	sfxDir := filepath.Join(runDir, "output", "sfx")
 	if err := os.MkdirAll(sfxDir, 0o755); err != nil {
@@ -233,12 +260,16 @@ func ensureSFX(cfg *config.Config, runDir string) []string {
 	}
 	lib := loadSFXLibrary(cfg)
 	var warnings []string
-	for _, fx := range plan.SoundFX {
+	for _, fx := range fxPlan.SoundFX {
 		if fx.ShotID == "" || strings.TrimSpace(fx.Name) == "" {
 			continue
 		}
 		if existing[fx.ShotID] {
 			continue
+		}
+		shotDur, shotRendered := shotIn[fx.ShotID]
+		if plan != nil && !shotRendered {
+			continue // 镜头未渲染：音效无落点，不生成不告警
 		}
 		if item, score := pickSFXForCue(lib, fx.Name); score > 0 {
 			dst := filepath.Join(sfxDir, fx.ShotID+".sfx"+strings.ToLower(filepath.Ext(item.File)))
@@ -250,12 +281,60 @@ func ensureSFX(cfg *config.Config, runDir string) []string {
 			fmt.Printf("  🔊 [%s] 音效 ← 曲库 %s（%s）\n", fx.ShotID, filepath.Base(item.File), fx.Name)
 			continue
 		}
+		// 二级：生成 API（豆包音频生成/MiniMax 由端点路由，MusicGen 内部分流）
+		if musicClient, err := musicGenClient(client, cfg); err != nil {
+			return []string{err.Error()}
+		} else if musicClient != nil {
+			secs := int(shotDur) + 1
+			if secs < 3 {
+				secs = 3
+			}
+			if secs > 30 {
+				secs = 30
+			}
+			prompt := fmt.Sprintf("影视音效，无对白无歌声。%s：%s。", fx.Name, fx.Description)
+			audioData, err := musicClient.MusicGen(prompt, secs)
+			if err != nil {
+				warnings = append(warnings, fmt.Sprintf("音效 [%s]（%s）生成失败: %v", fx.ShotID, fx.Name, err))
+				continue
+			}
+			dst := filepath.Join(sfxDir, fx.ShotID+".sfx.mp3")
+			if err := fsx.AtomicWrite(dst, audioData, 0o644); err != nil {
+				warnings = append(warnings, fmt.Sprintf("音效 [%s] 落盘失败: %v", fx.ShotID, err))
+				continue
+			}
+			existing[fx.ShotID] = true
+			fmt.Printf("  🔊 [%s] 音效 ← 生成（%s）\n", fx.ShotID, fx.Name)
+			continue
+		}
 		warnings = append(warnings, fmt.Sprintf(
 			"音效 [%s]（%s）无素材：往 output/sfx/ 放置 %s.sfx.wav，"+
 				"或在 %s/ 放置带描述标签的音频文件（如 雨_屋顶_循环.wav）自动匹配",
 			fx.ShotID, fx.Name, fx.ShotID, cfg.Music.SFXLibraryDir))
 	}
 	return warnings
+}
+
+// musicGenClient 构造面向音乐/音效生成的客户端（ensureMusic 与 ensureSFX
+// 共用）。未开启 music.generate 时返回 (nil, nil)——只告警不阻断。
+func musicGenClient(client *ai.Client, cfg *config.Config) (*ai.Client, error) {
+	if !cfg.Music.Generate || cfg.Mock {
+		if cfg.Mock && cfg.Music.Generate {
+			ep := cfg.Providers.Music
+			if client != nil && ep.BaseURL != "" && ep.Model != "" {
+				return client.For(ai.CapMusic, ai.Endpoint{
+					BaseURL: ep.BaseURL, APIKeyEnv: ep.APIKeyEnv,
+					APIKey: cfg.APIKeyFor(ep), Model: ep.Model,
+				}), nil
+			}
+		}
+		return nil, nil
+	}
+	ep := cfg.Providers.Music
+	if ep.BaseURL == "" || ep.Model == "" || client == nil {
+		return nil, fmt.Errorf("music.generate=true 但 providers.music 端点未配置完整（需要 base_url 与 model）")
+	}
+	return shotkit.CapClient(client, cfg, ai.CapMusic, ep, ep.Model)
 }
 
 // loadSFXLibrary 扫描音效库：文件名下划线/空格分词即标签。

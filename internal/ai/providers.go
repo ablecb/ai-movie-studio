@@ -34,6 +34,9 @@ type Endpoint struct {
 	// APIKey 直接给定的密钥（本地层）。env 名存在但未配到时作为兜底。
 	APIKey string
 	Model  string
+	// AppIDEnv/AppID 二级凭据（双凭据供应商用，如火山语音的 appid）。
+	AppIDEnv string
+	AppID    string
 }
 
 // Key 解析该端点的密钥：环境变量优先，其次直接给定的密钥。
@@ -44,6 +47,16 @@ func (e Endpoint) Key() string {
 		}
 	}
 	return strings.TrimSpace(e.APIKey)
+}
+
+// ResolveAppID 解析该端点的二级凭据：环境变量优先，其次直接给定的值。
+func (e Endpoint) ResolveAppID() string {
+	if e.AppIDEnv != "" {
+		if v := os.Getenv(e.AppIDEnv); v != "" {
+			return v
+		}
+	}
+	return strings.TrimSpace(e.AppID)
 }
 
 // HasKey 该端点是否具备真实调用条件。
@@ -74,6 +87,9 @@ func (c *Client) For(cap Capability, ep Endpoint) *Client {
 	}
 	if ep.Model != "" {
 		nc.cfg.Model = ep.Model
+	}
+	if appid := ep.ResolveAppID(); appid != "" {
+		nc.cfg.AppID = appid
 	}
 	// 该能力没有可用密钥时退回离线模式，避免拿别人的密钥去请求另一个服务
 	if !nc.cfg.HasKey() {

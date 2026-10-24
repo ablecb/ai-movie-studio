@@ -84,7 +84,7 @@ func TestEnsureMusic_AlreadySatisfied(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := configForMusicTest(t)
-	warns, err := ensureMusic(nil, cfg, dir)
+	warns, err := ensureMusic(nil, cfg, dir, nil, nil)
 	if err != nil {
 		t.Fatalf("已有素材时不应报错: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestEnsureMusic_MissingCueWarns(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := configForMusicTest(t)
-	warns, err := ensureMusic(nil, cfg, dir)
+	warns, err := ensureMusic(nil, cfg, dir, nil, nil)
 	if err != nil {
 		t.Fatalf("缺素材是缺输入不是错误，不应报错: %v", err)
 	}

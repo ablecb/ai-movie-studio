@@ -573,10 +573,18 @@ func (c *Client) TTSWith(text string, opt TTSOptions) ([]byte, error) {
 		return synthWAV(text), nil
 	}
 	// 供应商路由：MiniMax 端点走 T2A v2（emotion/pitch 参数真正生效），
+	// 火山语音端点走豆包 Seed-TTS（上下文情绪 + emotion_scale 强度可调），
 	// 其余（智谱等 OpenAI 风格 /audio/speech）走原路径。
-	// 两家的鉴权方式一致（Bearer），差异只在请求体与响应编码。
+	// 火山按凭据形态分路：配了 appid（旧版控制台双凭据）走 V1 非流式接口；
+	// 只有 API Key（新版控制台单凭据）走 V3 单向流式接口。
 	if isMiniMaxEndpoint(c.cfg.BaseURL) {
 		return c.minimaxTTS(text, opt)
+	}
+	if isSeedTTSEndpoint(c.cfg.BaseURL) {
+		if c.cfg.AppID != "" {
+			return c.seedTTS(text, opt)
+		}
+		return c.seedTTSV3(text, opt)
 	}
 	speed := opt.Speed
 	if math.Abs(speed-1.0) < 0.01 {

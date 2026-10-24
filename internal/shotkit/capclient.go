@@ -28,6 +28,7 @@ func CapClient(base *ai.Client, cfg *config.Config, capability ai.Capability, ep
 	c := base.For(capability, ai.Endpoint{
 		BaseURL: ep.BaseURL, APIKeyEnv: ep.APIKeyEnv,
 		APIKey: key, Model: model,
+		AppIDEnv: ep.AppIDEnv, AppID: cfg.AppIDFor(ep),
 	})
 	if c.Mock() && !cfg.Mock {
 		return nil, fmt.Errorf("providers.%s 指向端点 %s 但不可用（无可用密钥）", capability, ep.BaseURL)

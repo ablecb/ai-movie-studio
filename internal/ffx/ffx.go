@@ -447,22 +447,34 @@ func probeWithFFprobe(path string) (*Probe, error) {
 	}
 	p := &Probe{Path: path}
 	var cur string
+	var pendingName string
 	for _, line := range strings.Split(out, "\n") {
 		kv := strings.SplitN(strings.TrimSpace(line), "=", 2)
 		if len(kv) != 2 {
 			continue
 		}
 		k, v := kv[0], kv[1]
+		// ffprobe 按 schema 顺序输出字段：codec_name 恒在 codec_type 之前
+		//（与 -show_entries 的请求顺序无关）。先缓存 codec_name，等 codec_type
+		// 到位再归属到视频/音频流——顺序敏感的写法会让音频流永远配不上名，
+		// HasAudio 恒 false，交付校验误报"成片没有音轨"。
 		switch k {
+		case "codec_name":
+			pendingName = v
 		case "codec_type":
 			cur = v
-		case "codec_name":
-			if cur == "video" && p.VideoCodec == "" {
-				p.VideoCodec = v
-			} else if cur == "audio" && p.AudioCodec == "" {
-				p.AudioCodec = v
-				p.HasAudio = true
+			switch cur {
+			case "video":
+				if p.VideoCodec == "" {
+					p.VideoCodec = pendingName
+				}
+			case "audio":
+				if p.AudioCodec == "" {
+					p.AudioCodec = pendingName
+					p.HasAudio = true
+				}
 			}
+			pendingName = ""
 		case "width":
 			if cur == "video" {
 				fmt.Sscanf(v, "%d", &p.Width)

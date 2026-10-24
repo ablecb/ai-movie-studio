@@ -31,8 +31,13 @@ func (c *Client) MusicGen(prompt string, seconds int) ([]byte, error) {
 	if c.cfg.Mock {
 		return synthWAV("music"), nil
 	}
+	// 供应商路由：豆包端点走音频生成模型（音效/配乐同一通道，providers.music
+	// 指向 bytedance 即可，与 TTS 共用凭据）；MiniMax 端点走 Music。
+	if isSeedTTSEndpoint(c.cfg.BaseURL) {
+		return c.audioGen(prompt, seconds)
+	}
 	if !isMiniMaxEndpoint(c.cfg.BaseURL) {
-		return nil, fmt.Errorf("音乐生成当前仅支持 MiniMax 端点（providers.music.base_url 需含 minimax）")
+		return nil, fmt.Errorf("音乐生成支持 MiniMax（base_url 含 minimax）或豆包音频生成（base_url 含 bytedance）端点")
 	}
 	if strings.TrimSpace(prompt) == "" {
 		return nil, fmt.Errorf("音乐生成需要非空 prompt")

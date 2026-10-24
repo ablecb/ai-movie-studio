@@ -114,7 +114,17 @@ func Animatic(cfg *config.Config, runDir string) (string, error) {
 
 	// 声音：有此前 deliver 的逐句配音产物时铺 scratch track（按实测入点）。
 	// 基底静音 anullsrc 铺满全片时长，逐句 adelay 到位后与基底 amix。
-	voiceTracks := loadAnimaticVoice(runDir)
+	// 配音铺轨必须用**分镜自身的时间轴**：分镜时长是"计划值 + 已渲染镜头的
+	// 实测值"，而成片时间轴（narration.json 的 abs_start_sec）只含已渲染镜头
+	// 且按实测连续排列——两套时间轴必然错位，直接用 abs 入点会让台词
+	// 越往后越偏（表现为"台词先后顺序对不上"）。改为按 shot 相对入点换算。
+	startOf := make(map[string]float64, len(shots))
+	var t float64
+	for _, s := range shots {
+		startOf[s.ID] = t
+		t += s.Dur
+	}
+	voiceTracks := loadAnimaticVoice(runDir, startOf)
 	hasVoice := len(voiceTracks) > 0 && ffx.HasFilter("amix")
 	if hasVoice {
 		base := len(shots)
@@ -194,11 +204,12 @@ type animaticVoice struct {
 
 // loadAnimaticVoice 收集 deliver 阶段已产出的逐句配音（含实测入点）。
 // animatic 是渲染前的预览，通常没有这些产物——返回空即无声预览。
-func loadAnimaticVoice(runDir string) []animaticVoice {
+func loadAnimaticVoice(runDir string, startOf map[string]float64) []animaticVoice {
 	var plan struct {
 		Lines []struct {
-			File        string  `json:"file"`
-			AbsStartSec float64 `json:"abs_start_sec"`
+			ShotID   string  `json:"shot_id"`
+			StartSec float64 `json:"start_sec"` // 相对所属镜头起点的入点（J-cut 为负）
+			File     string  `json:"file"`
 		} `json:"lines"`
 	}
 	if err := fsx.ReadJSON(filepath.Join(runDir, "artifacts", "narration.json"), &plan); err != nil {
@@ -209,9 +220,17 @@ func loadAnimaticVoice(runDir string) []animaticVoice {
 		if l.File == "" {
 			continue
 		}
+		base, ok := startOf[l.ShotID]
+		if !ok {
+			continue // 镜头不在分镜时间轴上（不应发生，防御）
+		}
+		start := base + l.StartSec
+		if start < 0 {
+			start = 0 // J-cut 提前量越出片头时钳到 0（adelay 不接受负值）
+		}
 		p := filepath.Join(runDir, filepath.FromSlash(l.File))
 		if fsx.FileExists(p) {
-			out = append(out, animaticVoice{path: p, startSec: l.AbsStartSec})
+			out = append(out, animaticVoice{path: p, startSec: start})
 		}
 	}
 	return out

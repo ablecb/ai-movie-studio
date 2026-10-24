@@ -288,6 +288,12 @@ func prepareLine(client, ttsClient *ai.Client, ttsModel string, notesSpeed float
 	cfg *config.Config, opt Options, kit *promspec.Kit,
 	slotOf map[string]ShotSlot, voiceMap map[string]string, n narrationLine, idx int) (*Line, error) {
 
+	// 全片去旁白（audio.skip_narrator）：对白驱动的短剧风格不需要画外音。
+	// 在合成入口过滤且**保持台词索引**——缓存文件名按索引编号，过滤后
+	// 对白句照样命中已付费的缓存；plan.Lines 里也不再有旁白（字幕/混音联动）。
+	if cfg.Audio.SkipNarrator && promspec.IsNarrator(n.Speaker) {
+		return nil, nil
+	}
 	slot, ok := slotOf[n.ShotID]
 	if !ok {
 		if opt.AllowIncomplete {

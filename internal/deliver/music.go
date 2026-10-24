@@ -166,8 +166,9 @@ type musicPlanDoc struct {
 		DurationSec float64 `json:"duration_sec"`
 	} `json:"cue_sheet"`
 	SoundFX []struct {
-		ShotID string `json:"shot_id"`
-		Name   string `json:"name"`
+		ShotID      string `json:"shot_id"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
 	} `json:"sound_fx"`
 }
 
