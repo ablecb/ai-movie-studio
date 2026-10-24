@@ -199,8 +199,12 @@ type Audio struct {
 	// SkipNarrator 全片关闭旁白/独白：配音只出角色对白（短剧对白驱动风格）。
 	// 过滤在合成入口完成，台词索引保持原序——对白句的缓存文件名不受影响，
 	// 已付费的合成资产照常复用。
-	SkipNarrator bool    `json:"skip_narrator,omitempty"`
-	BGMGainDB    float64 `json:"bgm_gain_db"`
+	SkipNarrator bool `json:"skip_narrator,omitempty"`
+	// MouthAlign 口型对齐（段落级）：检测镜头里角色的张嘴窗口，把台词
+	// 入点对到窗口起点、时长适配到窗口长度。检测走视觉模型（付费，结果
+	// 缓存 artifacts/mouth_windows.json），失败/低置信度回落普通入点。
+	MouthAlign bool    `json:"mouth_align,omitempty"`
+	BGMGainDB  float64 `json:"bgm_gain_db"`
 	// DuckDB 人声出现时 BGM 的压低量（dB，负值，典型 -9）。
 	//
 	// 实现说明：sidechaincompress 没有"压低 N dB"这样的直接参数，只有阈值与压缩比。

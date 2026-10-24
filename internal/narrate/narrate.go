@@ -34,6 +34,7 @@ import (
 	"aistudio/internal/config"
 	"aistudio/internal/ffx"
 	"aistudio/internal/fsx"
+	"aistudio/internal/mouth"
 	"aistudio/internal/promspec"
 	"aistudio/internal/shotkit"
 	"aistudio/internal/subtitle"
@@ -67,7 +68,10 @@ type Line struct {
 	AbsStartSec float64 `json:"abs_start_sec"` // 相对成片的入点
 	// JCutSec 该句提前于所属镜头画面的秒数（J-cut：前镜无台词时声音先入，
 	// 带着观众进下一镜）。0 = 未做 J-cut。字幕按同一提前量排版，音画字仍然同步。
-	JCutSec   float64 `json:"jcut_sec,omitempty"`
+	JCutSec float64 `json:"jcut_sec,omitempty"`
+	// MouthWin 口型说话窗口（相对镜头起点；nil=未做口型对齐）。
+	// 写进交付报告与字幕排版依据，是"口型对齐"质检项的数据源。
+	MouthWin *mouth.Window `json:"mouth_win,omitempty"`
 	Pitch     float64 `json:"pitch"`
 	Speed     float64 `json:"speed"`
 	SlotSec   float64 `json:"slot_sec"`
@@ -99,6 +103,9 @@ type ShotSlot struct {
 	Duration   float64  `json:"duration"`
 	PlanSec    float64  `json:"plan_duration_sec"`
 	Characters []string `json:"characters,omitempty"`
+	// SpeakWin 口型说话窗口（相对镜头起点；nil=未检测到/未开启对齐）。
+	// 台词入点对到 WinStart、时长适配到窗长——段落级口型同步。
+	SpeakWin *mouth.Window `json:"speak_win,omitempty"`
 }
 
 // Run 执行配音流水线：生成台词音频并产出配音计划。
@@ -129,6 +136,15 @@ func Run(client *ai.Client, cfg *config.Config, opt Options) (*Plan, error) {
 	slotOf := map[string]ShotSlot{}
 	for _, s := range slots {
 		slotOf[s.ShotID] = s
+	}
+
+	// 口型对齐（audio.mouth_align）：为有台词的镜头检测说话窗口。
+	// 并行检测、缓存复用；失败回落 nil 窗口（走普通入点），绝不阻断配音。
+	if cfg.Audio.MouthAlign {
+		alignSpeakWindows(client, cfg, opt.RunDir, vo, slots)
+		for i := range slots {
+			slotOf[slots[i].ShotID] = slots[i]
+		}
 	}
 
 	// 音色映射：命令行 > 配置 > 角色设定 > 默认
@@ -265,6 +281,86 @@ func Run(client *ai.Client, cfg *config.Config, opt Options) (*Plan, error) {
 	return plan, nil
 }
 
+// alignSpeakWindows 就地填充 slots 的 SpeakWin：有台词的镜头才检测。
+// 窗口缓存全局共享（artifacts/mouth_windows.json），重跑交付零检测成本。
+func alignSpeakWindows(client *ai.Client, cfg *config.Config, runDir string,
+	vo *voiceoverDoc, slots []ShotSlot) {
+	// 嘴态判定是视觉调用：走 providers.vision 端点（与视觉复核同源），
+	// 共享同一花费账本。端点不可用只降级对齐（回落普通入点），不阻断配音。
+	visionClient, err := shotkit.CapClient(client, cfg, ai.CapVision, cfg.Providers.Vision, cfg.Models.Vision)
+	if err != nil {
+		fmt.Printf("  ⚠ 口型对齐不可用（%v），台词走普通入点\n", err)
+		return
+	}
+	need := map[string]bool{}
+	for _, n := range vo.Narration {
+		if !promspec.IsNarrator(n.Speaker) {
+			need[n.ShotID] = true
+		}
+	}
+	cache := mouth.LoadCache(runDir)
+	manifest, _ := loadManifest(runDir)
+	videoOf := map[string]string{}
+	if manifest != nil {
+		for _, s := range manifest.Shots {
+			if s.Status == "done" && s.Video != "" {
+				videoOf[s.ID] = filepath.Join(runDir, filepath.FromSlash(s.Video))
+			}
+		}
+	}
+	var durOf map[string]float64
+	if plan, err := loadPlanForWindows(runDir); err == nil {
+		durOf = plan
+	}
+	conc.ForEachIdx(len(slots), 2, func(i int) {
+		s := slots[i]
+		if !need[s.ShotID] {
+			return
+		}
+		if w, ok := cache[s.ShotID]; ok {
+			if w.Valid() {
+				slots[i].SpeakWin = w
+			}
+			return
+		}
+		video := videoOf[s.ShotID]
+		if video == "" {
+			return
+		}
+		dur := durOf[s.ShotID]
+		if dur <= 0 {
+			dur = s.Duration
+		}
+		w, err := mouth.Detect(visionClient, video, dur, mouth.Options{Frames: 12, Width: 480})
+		if err != nil {
+			fmt.Printf("  ⚠ 口型检测 [%s] 失败（回落普通入点）: %v\n", s.ShotID, err)
+			return
+		}
+		if w != nil && w.Valid() {
+			slots[i].SpeakWin = w
+			cache[s.ShotID] = w
+			fmt.Printf("  👄 [%s] 说话窗口 %.2fs–%.2fs（置信度 %.0f%%）\n",
+				s.ShotID, w.Start, w.End, w.Confidence*100)
+		}
+	})
+	if err := mouth.SaveCache(runDir, cache); err != nil {
+		fmt.Printf("  ⚠ 口型窗口缓存写入失败（不影响本次交付）: %v\n", err)
+	}
+}
+
+// loadPlanForWindows 从已缓存的实测时长里取镜头时长（避免重复 ffprobe）。
+func loadPlanForWindows(runDir string) (map[string]float64, error) {
+	var plan Plan
+	if err := fsx.ReadJSON(filepath.Join(runDir, "artifacts", "narration.json"), &plan); err != nil {
+		return nil, err
+	}
+	out := map[string]float64{}
+	for _, s := range plan.Shots {
+		out[s.ShotID] = s.Duration
+	}
+	return out, nil
+}
+
 // countNil 统计被跳过的台词句（所属镜头未渲染，prepareLine 返回 nil）。
 func countNil(lines []*Line) int {
 	n := 0
@@ -384,10 +480,18 @@ func prepareLine(client, ttsClient *ai.Client, ttsModel string, notesSpeed float
 		l.Pitch = pitchFor(kit, n.Speaker)
 	}
 
-	// 4) 时长适配：目标 = 镜头槽位可用时长（留出 0.25s 呼吸）
+	// 4) 时长适配：有说话窗口时适配到窗长（口型段落对齐的核心），
+	//    否则目标 = 镜头槽位可用时长（留出 0.25s 呼吸）
 	slotBudget := slot.Duration - 0.25
 	if slotBudget < 0.6 {
 		slotBudget = slot.Duration
+	}
+	if w := slot.SpeakWin; w != nil && w.Valid() {
+		// 窗口装得下（在加速上限内）才按窗长适配——精确对齐"张嘴到闭嘴"；
+		// 装不下就不无谓加速：起点仍对齐窗口，溢出如实标注（画外延续）。
+		if win := w.End - w.Start; l.RawSec > 0 && win/l.RawSec >= cfg.Audio.MaxSpeedUp && win > 0.6 {
+			slotBudget = win
+		}
 	}
 	proc, err := processToSlot(cfg, rawPath, procPath, l.Pitch, slotBudget)
 	if err != nil {
@@ -428,6 +532,14 @@ func layoutLine(l *Line, slot ShotSlot, cursor float64, cfg *config.Config, jcut
 	if jcutLead > 0 {
 		abs = slot.Start - jcutLead
 	}
+	// 口型窗口优先：入点=张嘴时刻。声音"等嘴"而不是嘴"等声"——
+	// 窗口来自对这段视频的检测，置信度不足时上游不填窗口，走原逻辑。
+	// 音频长于窗口时允许向后续镜头画外延续（电影常规手法），只要求
+	// 入点本身落在镜头内；因此 clamp 上界是镜头末尾而非"剩余空间"。
+	if w := slot.SpeakWin; w != nil && w.Valid() {
+		abs = slot.Start + clamp(w.Start, 0, math.Max(0, slot.Duration))
+		jcutLead = 0 // 声音已锚定在镜头内的说话区间，不再提前越切点
+	}
 	if abs < cursor+cfg.Audio.LineGapSec {
 		abs = cursor + cfg.Audio.LineGapSec
 		jcutLead = 0 // 被上一句的尾巴顶回：放弃 J-cut，保证不叠音
@@ -435,6 +547,7 @@ func layoutLine(l *Line, slot ShotSlot, cursor float64, cfg *config.Config, jcut
 	l.StartSec = abs - slot.Start
 	l.AbsStartSec = abs
 	l.JCutSec = jcutLead
+	l.MouthWin = slot.SpeakWin
 	if l.MeasuredSec > slot.Duration {
 		l.Overflow = true
 	}

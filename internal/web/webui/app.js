@@ -173,7 +173,7 @@ function qcReviewModal(run, ref) {
 /* ================= 任务 ================= */
 const jobTypeLabel = {
   run: '创作流水线', resume: '断点续跑', render: '渲染生成', animatic: '动态分镜',
-  deliver: '交付成片', polish: '打磨闭环', takes: '多 Take 对比', verify: '复核',
+  deliver: '交付成片', polish: '打磨闭环', takes: '多 Take 对比', verify: '复核', dub: '一键配音',
   doctor: '环境自检', 'probe-ref': '参考图探针', assets: '素材库',
 };
 
@@ -1390,7 +1390,10 @@ async function pageAudio(view) {
   view.innerHTML = `
     <div class="panel">
       <div class="panel-head"><span>🎙 配音台词（唯一真源 voiceover → 逐句实测）</span>
-        <span class="sub">${narration && narration.length ? `${narration.length} 句` : '暂无'} · 溢出的句子会顺延而非截断</span></div>
+        <span style="display:flex;gap:8px;align-items:center">
+          <button class="btn btn-primary" id="btn-dub" title="Seed-TTS 逐句合成 → 口型窗口对齐 → 音效/配乐生成 → 混音 → 字幕 → 成片">🎬 一键配音</button>
+          <span class="sub">${narration && narration.length ? `${narration.length} 句` : '暂无'} · 溢出的句子会顺延而非截断</span>
+        </span></div>
       ${narration && narration.length ? `<div style="overflow-x:auto"><table class="tbl">
         <tr><th>#</th><th>镜头</th><th>角色</th><th>台词</th><th>情绪</th><th>语速</th><th class="num">实测</th><th class="num">入点</th><th>试听</th></tr>
         ${narration.map((l, i) => `<tr>
@@ -1443,6 +1446,11 @@ async function pageAudio(view) {
       if (el) el.textContent = t;
     }).catch(() => { });
   }
+
+  const dubBtn = $('#btn-dub');
+  if (dubBtn) dubBtn.onclick = () => startJob('dub', run, {}, {
+    confirmText: '一键配音 = TTS 逐句合成 + 口型对齐 + 音效/配乐生成 + 混音 + 字幕 + 成片（首次约几分钟，含少量 API 费用；已生成的素材自动复用不重复计费）。确认开始？',
+  });
 }
 
 /* ================= 页面：交付成片 ================= */

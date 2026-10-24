@@ -44,7 +44,7 @@ const (
 var jobTypes = map[string]bool{
 	"run": true, "resume": true, "render": true, "animatic": true,
 	"deliver": true, "polish": true, "takes": true, "verify": true,
-	"doctor": true, "probe-ref": true, "assets": true,
+	"doctor": true, "probe-ref": true, "assets": true, "dub": true,
 }
 
 // JobManager 管理任务的注册、执行、取消与持久化。
@@ -420,6 +420,19 @@ func (m *JobManager) buildArgs(jobType, runID string, p map[string]any) ([]strin
 		add("--run", runPath())
 		add("--config", configArg(p))
 		return args, "拼装动态分镜 " + runID, nil
+
+	case "dub":
+		// 一键配音：deliver 的声音语义快捷方式——TTS + 口型对齐 + 音效/配乐
+		// 生成 + 混音 + 字幕 + 成片。残缺 run 只配已渲染镜头（报告如实标注），
+		// 视觉复核不在配音链路里（打磨闭环/交付页有独立入口）。
+		if runID == "" {
+			return nil, "", fmt.Errorf("缺少 run")
+		}
+		add("--run", runPath())
+		add("--allow-incomplete")
+		add("--no-visual")
+		add("--config", configArg(p))
+		return args, "一键配音 " + runID, nil
 
 	case "deliver":
 		if runID == "" {

@@ -145,9 +145,11 @@
   "tts_speed": 1.0,
   "tts_emotion": true,
   "line_gap_sec": 0.28,
-  "lead_in_sec": 0.18,
+  "lead_in_sec": 0,
   "target_loudness_lufs": -14,
-  "skip_narrator": true
+  "skip_narrator": true,
+  "jcut_sec": 0.5,
+  "mouth_align": true
  },
  "transitions": {
   "enabled": true,

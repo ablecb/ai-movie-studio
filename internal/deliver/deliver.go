@@ -779,6 +779,23 @@ func verify(cfg *config.Config, rep *Report, release, withAudio string, clips []
 		add("声轨存在", false, true, "成片没有音轨，但有 %d 句台词", len(plan.Lines))
 	}
 
+	// 4.5) 口型对齐（audio.mouth_align 开启时）：报告每句台词的说话窗口
+	// 命中情况与拟合语速——段落级口型同步的可观测性。
+	if cfg.Audio.MouthAlign && plan != nil && len(plan.Lines) > 0 {
+		aligned, lowConf := 0, 0
+		for _, l := range plan.Lines {
+			if l.MouthWin != nil && l.MouthWin.Valid() {
+				aligned++
+				if l.MouthWin.Confidence < 0.4 {
+					lowConf++
+				}
+			}
+		}
+		add("口型对齐", aligned > 0, false,
+			"%d/%d 句命中说话窗口（低置信度 %d 句；未命中的走普通入点）",
+			aligned, len(plan.Lines), lowConf)
+	}
+
 	// 5) 字幕
 	if subInfo.CueCount > 0 {
 		add("字幕条数非零", true, false, "%d 条，覆盖率 %.1fs", subInfo.CueCount, subInfo.CoverageSec)
