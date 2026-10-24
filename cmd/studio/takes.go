@@ -127,7 +127,11 @@ func makeTake(client *ai.Client, cfg *config.Config, runDir, takeDir, id string)
 
 // judgeTakes 让视觉模型对比两个 take，返回推荐（不可用时返回 nil，只留并排片）。
 func judgeTakes(cfg *config.Config, runDir, takeA, takeB, shotID string) *takeVerdict {
-	vc := newVisionClient(cfg)
+	vc, verr := newVisionClient(cfg)
+	if verr != nil {
+		fmt.Printf("  ⚠ 视觉端点不可用（%v），跳过机器评分（人工看对比片决定）\n", verr)
+		return nil
+	}
 	if vc.Mock() {
 		fmt.Println("  ⚠ 未配置视觉端点，跳过机器评分（人工看对比片决定）")
 		return nil

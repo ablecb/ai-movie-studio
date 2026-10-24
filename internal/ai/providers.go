@@ -1,10 +1,13 @@
 package ai
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 // Capability 能力标识：不同能力可以接不同的服务商。
@@ -149,13 +152,28 @@ type visionImage struct {
 //   - DeepSeek：模型名 deepseek-flash（v4-pro 不支持视觉）；单请求最多 600 图、
 //     总 64MiB，单图自动缩放到约 1300×1300 且每图最多 1024 token
 func (c *Client) VisionJSONEx(system, prompt string, images []ImageRef, detail string, out any) error {
+	span, rec, done, fail := beginCall(KindChat, "vision", c.cfg.Model)
+	rec.Mock = c.cfg.Mock
+	rec.Request = &CallRequest{
+		System: truncateCall(system), Prompt: truncateCall(prompt),
+		Temperature: 0.1, MaxTokens: 4096, RefImages: len(images),
+	}
 	if c.cfg.Mock {
-		return mockVision(prompt, out)
+		err := mockVision(prompt, out)
+		if err != nil {
+			fail(err)
+		} else {
+			done(&CallResponse{Text: "(离线演示结构化输出)", Model: c.cfg.Model})
+		}
+		return err
 	}
 	if len(images) == 0 {
-		return fmt.Errorf("视觉复核需要至少一张图片")
+		err := fmt.Errorf("视觉复核需要至少一张图片")
+		fail(err)
+		return err
 	}
 	if err := c.guardBudget("vision"); err != nil {
+		fail(err)
 		return err
 	}
 	if detail == "" {
@@ -168,7 +186,9 @@ func (c *Client) VisionJSONEx(system, prompt string, images []ImageRef, detail s
 			var err error
 			url, err = c.imageRef(img.Path)
 			if err != nil {
-				return fmt.Errorf("读取复核图片失败 (%s): %w", shortName(img.Path), err)
+				err = fmt.Errorf("读取复核图片失败 (%s): %w", shortName(img.Path), err)
+				fail(err)
+				return err
 			}
 		}
 		content = append(content, visionContent{Type: "image_url", ImageURL: &visionImage{URL: url, Detail: detail}})
@@ -184,26 +204,87 @@ func (c *Client) VisionJSONEx(system, prompt string, images []ImageRef, detail s
 		MaxTokens:   4096,
 	})
 	if err != nil {
+		fail(err)
 		return err
 	}
-	data, err := c.post("/chat/completions", body)
-	if err != nil {
-		return err
-	}
+	// 送检 + 取回可解析的 JSON：两层有界重试。
+	// ① HTTP 层：端点对同一请求存在随机拒绝（见 postVisionRetry 注释）；
+	// ② 输出层：思考型模型偶发输出不可解析文本（真实事故：一张参考帧的核对
+	//    返回了一段散文，"输出中未找到 JSON 对象"直接把 assets 阶段判死）。
+	// 核对是只读调用，重试不产生副作用；每次尝试都计入用量。
 	var resp chatResponse
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return fmt.Errorf("解析视觉响应失败: %w", err)
+	var raw []byte
+	const parseAttempts = 3
+	for attempt := 1; ; attempt++ {
+		data, err := c.postVisionRetry(span.ctx(c.Context()), "/chat/completions", body)
+		if err != nil {
+			fail(err)
+			return err
+		}
+		if err := json.Unmarshal(data, &resp); err != nil {
+			err = fmt.Errorf("解析视觉响应失败: %w", err)
+			fail(err)
+			return err
+		}
+		if len(resp.Choices) == 0 {
+			err := fmt.Errorf("视觉模型返回空结果（图片可能被内容审核拦截）")
+			fail(err)
+			return err
+		}
+		c.recordUsage("vision", resp.Usage)
+		c.recordTokens(CostVision, c.priceOf(CostVision), resp.Usage)
+		rec.Usage = resp.Usage
+		raw, err = ExtractJSON(resp.Choices[0].Message.Content)
+		if err == nil {
+			break
+		}
+		if attempt >= parseAttempts {
+			err = fmt.Errorf("视觉复核输出无法解析为 JSON（重试 %d 次仍失败）: %w", parseAttempts, err)
+			fail(err)
+			return err
+		}
+		fmt.Printf("  ↻ 视觉输出无法解析为 JSON（%v），重新送检（第 %d/%d 次）\n", err, attempt+1, parseAttempts)
 	}
-	if len(resp.Choices) == 0 {
-		return fmt.Errorf("视觉模型返回空结果（图片可能被内容审核拦截）")
-	}
-	c.recordUsage("vision", resp.Usage)
-	c.recordTokens(CostVision, c.priceOf(CostVision), resp.Usage)
-	raw, err := ExtractJSON(resp.Choices[0].Message.Content)
-	if err != nil {
-		return fmt.Errorf("视觉复核输出无法解析为 JSON: %w", err)
-	}
+	done(&CallResponse{Text: truncateCall(resp.Choices[0].Message.Content), Model: c.cfg.Model})
 	return json.Unmarshal(raw, out)
+}
+
+// postVisionRetry 视觉送检的有界重试（最多 3 次尝试，间隔 1s/2s）。
+//
+// 为什么要重试一个 400：实测（同一张图、同一请求体、连续多次）智谱端点对
+// vision 请求存在随机拒绝——约 1/3 的请求在 ~0.7s 内被 400 打回，且失败时
+// 服务端给出的校验层还不一样（"API 调用参数有误，请检查文档" 与
+// "messages[0].content[0].file必须传入file_id、file_url、file_data至少之一"），
+// 同一请求重发即成功。这是服务端路由/校验版本的差异，不是请求格式错误——
+// 真实事故：一张参考帧的核对被随机 400 卡住，整个 assets 阶段失败。
+// 鉴权/余额/模型不支持属真实配置问题，不重试（重试只会掩盖故障）。
+func (c *Client) postVisionRetry(ctx context.Context, path string, body []byte) ([]byte, error) {
+	const attempts = 3
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			wait := time.Duration(i) * time.Second
+			fmt.Printf("  ↻ 视觉送检被端点拒绝（%v），%s 后重试（第 %d/%d 次）\n", lastErr, wait, i+1, attempts)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+		}
+		data, err := c.postCtx(ctx, path, body)
+		if err == nil {
+			if i > 0 {
+				fmt.Printf("  ✓ 视觉送检重试成功（第 %d 次尝试）\n", i+1)
+			}
+			return data, nil
+		}
+		var ae *APIError
+		if errors.As(err, &ae) && (ae.Kind == KindAuth || ae.Kind == KindNoFund || ae.Kind == KindUnsupported) {
+			return nil, err
+		}
+		lastErr = err
+	}
+	return nil, lastErr
 }
 
 // Ping 轻量连通性探测：用一张 1x1 图片验证该端点/模型是否真的支持视觉。

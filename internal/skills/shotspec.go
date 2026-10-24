@@ -2,9 +2,11 @@ package skills
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"aistudio/internal/promspec"
+	"aistudio/internal/shotkit"
 	"aistudio/internal/skill"
 	"aistudio/internal/srt"
 )
@@ -51,22 +53,114 @@ type characterOut struct {
 }
 
 type shotOne struct {
-	ID             string   `json:"id"`
-	ActionEn       string   `json:"action_en"`
-	ShotSizeEn     string   `json:"shot_size_en"`
-	CameraMoveEn   string   `json:"camera_move_en"`
-	LensMM         int      `json:"lens_mm"`
-	TStop          string   `json:"t_stop"`
-	LightKey       string   `json:"light_key"`
-	LightQuality   string   `json:"light_quality"`
-	LightDirection string   `json:"light_direction"`
-	LightRatio     string   `json:"light_ratio"`
-	ColorTemp      float64  `json:"color_temp"`
-	Composition    string   `json:"composition"`
-	SubjectPos     string   `json:"subject_position"`
-	Emotion        string   `json:"emotion"`
-	Note           string   `json:"note"`
-	Characters     []string `json:"characters"`
+	ID             string  `json:"id"`
+	ActionEn       string  `json:"action_en"`
+	ShotSizeEn     string  `json:"shot_size_en"`
+	CameraMoveEn   string  `json:"camera_move_en"`
+	LensMM         int     `json:"lens_mm"`
+	TStop          string  `json:"t_stop"`
+	LightKey       string  `json:"light_key"`
+	LightQuality   string  `json:"light_quality"`
+	LightDirection string  `json:"light_direction"`
+	LightRatio     string  `json:"light_ratio"`
+	ColorTemp      float64 `json:"color_temp"`
+	Composition    string  `json:"composition"`
+	SubjectPos     string  `json:"subject_position"`
+	Emotion        string  `json:"emotion"`
+	Note           string  `json:"note"`
+	// SceneState 本镜的环境状态变体 slug（只能取自素材规划为该场次声明的清单；
+	// 空 = 仍处于场次初始状态）。渲染据此选环境基准图。
+	SceneState string `json:"scene_state"`
+	// MouthVisibility 说话人嘴部在画面中的可见性（visible/covered/offscreen）。
+	// 有画面内台词必须声明；没有画面内台词必须留空。
+	MouthVisibility string `json:"mouth_visibility"`
+	// ShotSize 景别修正（中文枚举，空 = 沿用分镜）。仅在"说话人嘴部清晰可见 +
+	// 特写/大特写"导致口型穿帮、必须改景别时填写；代码据此重算 shot_size_en 与焦段。
+	ShotSize   string   `json:"shot_size"`
+	Characters []string `json:"characters"`
+}
+
+// mouthVisibilityEnum 说话人嘴部可见性的合法取值。
+var mouthVisibilityEnum = map[string]bool{"visible": true, "covered": true, "offscreen": true}
+
+// resolveShotSize 应用 shotspec 对分镜景别的修正（空 = 不改；改则限枚举内合法值）。
+//
+// 为什么必须允许修正：分镜给的"特写正对说话人"在无声生成 + 后期配音的管线里
+// 必然口型穿帮，而景别是分镜的机器枚举、镜头语言由代码编译——修正只能落在这个
+// 字段上（只改 shot_size_en 而留着中文枚举，会得到"英文说中景、焦段按特写算"的
+// 自相矛盾规格）。景别一改，英文描述与光学参数按新景别重编译。
+func resolveShotSize(spec *promspec.ShotSpec, declared string) error {
+	d := strings.TrimSpace(declared)
+	if d == "" || d == spec.ShotSize {
+		return nil
+	}
+	if !shotSizeEnum[d] {
+		return fmt.Errorf("产出校验失败: 镜头 %s 的 shot_size=%q 不在枚举内（大远景/远景/全景/中景/近景/特写/大特写）", spec.ID, d)
+	}
+	spec.ShotSize = d
+	spec.ShotSizeEn = promspec.ShotSizeEn(d)
+	spec.Lens = promspec.LensFor(d, 0)
+	return nil
+}
+
+// applyMouthVisibility 校验并归一 mouth_visibility（口型穿帮的确定性下限）。
+//
+// 背景：生成端是无声生成（音频不进请求）、TTS 在交付期才叠上去——口型与台词
+// 之间没有任何绑定机制。"嘴清晰可见地在说话"是穿帮的最坏形态，而"看不见嘴"的
+// 构图（侧脸/背身/前景遮挡/说话人出画）天然规避，且本就是电影常用的语言。
+//
+// 规则：无画面内台词 → 必须留空（填了归一为空并告警）；有画面内台词 → 必须声明，
+// 且 visible 不允许搭配 特写/大特写。
+func applyMouthVisibility(spec *promspec.ShotSpec, declared string, logf func(string, ...any)) error {
+	declared = strings.ToLower(strings.TrimSpace(declared))
+	onScreen := spec.SpeakingCharacters()
+	if len(onScreen) == 0 {
+		if declared != "" && logf != nil {
+			logf("  ⚠ 镜头 %s 没有画面内台词却声明了 mouth_visibility=%s，已清空", spec.ID, declared)
+		}
+		spec.MouthVisibility = ""
+		return nil
+	}
+	if declared == "" {
+		return fmt.Errorf("产出校验失败: 镜头 %s 有画面内台词（%s）却没有声明 mouth_visibility（visible/covered/offscreen）：生成端无声、配音后期叠加，口型与台词必然对不上，必须声明可见性让构图规避穿帮", spec.ID, strings.Join(onScreen, "、"))
+	}
+	if !mouthVisibilityEnum[declared] {
+		return fmt.Errorf("产出校验失败: 镜头 %s 的 mouth_visibility=%q 不合法（可用 visible/covered/offscreen）", spec.ID, declared)
+	}
+	if declared == "visible" && (spec.ShotSize == "特写" || spec.ShotSize == "大特写") {
+		return fmt.Errorf("产出校验失败: 镜头 %s 是 %s 且说话人嘴部清晰可见（visible）——正对嘴部的特写是口型穿帮的最坏形态。请二选一：① 改成看不见嘴的构图并声明 covered/offscreen（侧脸/背身/前景遮挡/说话人出画，并在 composition 里写明遮挡方式）；② 用 shot_size 把景别修正为 中景/近景 等", spec.ID, spec.ShotSize)
+	}
+	spec.MouthVisibility = declared
+	return nil
+}
+
+// containsStr 值是否在列表中（环境状态 slug 校验用）。
+func containsStr(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
+	}
+	return false
+}
+
+// validateSceneState 校验并归一 scene_state：空（场次初始状态）恒合法；非空必须
+// 命中素材规划为该场次声明的状态清单——错的 slug 会让渲染期拿不到基准图（硬失败）
+// 或指向另一状态的图（静默带偏整镜画面），两种都比在创作阶段拦下来贵。
+// 返回归一后的 slug（空字符串 = 不绑定状态）。
+func validateSceneState(shotID, sceneID, state string, statesByScene map[string][]string) (string, error) {
+	st := strings.TrimSpace(state)
+	if st == "" {
+		return "", nil
+	}
+	valid := statesByScene[sceneID]
+	if len(valid) == 0 {
+		return "", fmt.Errorf("产出校验失败: 镜头 %s 填了 scene_state=%q，但素材规划没有为场次 %s 声明任何状态变体（该字段应留空字符串）", shotID, st, sceneID)
+	}
+	if !containsStr(valid, st) {
+		return "", fmt.Errorf("产出校验失败: 镜头 %s 的 scene_state=%q 不在场次 %s 声明的状态清单内（可用：%s）", shotID, st, sceneID, strings.Join(valid, "、"))
+	}
+	return st, nil
 }
 
 type shotSpecSkill struct{}
@@ -98,6 +192,18 @@ func (shotSpecSkill) Run(ctx *skill.Context) (any, error) {
 	preset := promspec.PresetFor(script.Style + " " + script.Genre + " " + ctx.Brief)
 	style := preset.Style
 
+	// 场次环境状态清单（素材规划产出）：scene_state 只能取这里为该场次声明过的 slug。
+	// 没有规划（未跑素材阶段）时清单为空，所有镜头的 scene_state 必须留空——
+	// 渲染会退回场次主基准图作环境锚，这是"未提供"而非降级。
+	statesByScene := map[string][]string{}
+	if plan := shotkit.LoadAssetPlan(ctx.WorkDir); plan != nil {
+		for _, st := range plan.SceneStates {
+			for _, sid := range st.SceneIDs {
+				statesByScene[sid] = append(statesByScene[sid], st.State)
+			}
+		}
+	}
+
 	out := &shotSpecOut{}
 	if ctx.AI.Mock() {
 		out = mockShotSpec(bible, sb)
@@ -105,23 +211,43 @@ func (shotSpecSkill) Run(ctx *skill.Context) (any, error) {
 		system := filmBase + `
 你是摄影指导兼视觉规格撰写者。你的输出不是最终提示词，而是**创作判断**：景别、运镜、光学参数、
 照明方案、构图、情绪、以及每个镜头的表演节拍。提示词将由系统根据你的判断按固定模板编译。
+action_en / shot_size_en / camera_move_en / light_key 会逐字编译进图像与视频生成提示词：
+一律使用中性、健康的视觉词汇——严禁出现 blood、wound、corpse、weapon、hijack、restrain、inject、
+dead 等易触发内容审核的词（即使剧情需要，也改用光影对比、构图挤压、道具暗示来表达张力，
+如 dim stains、worn props、tense silhouette）；审核拦截是 HTTP 400 硬失败，整镜报废。
 
 schema：
 {"style":{"name":"整体视觉风格名","aspect":"画幅如 2.39:1","time_of_day":"主时段","palette":"色彩方案"},
  "characters":[{"name":"角色名","age":"年龄","ethnicity":"族裔","build":"体态","hair":"发型发色","face":"骨相与五官细节（决定是否同一个人）","skin":"皮肤质感（必须写毛孔/纹理等真实细节）","eyes":"眼睛特征","distinctive":["标志性特征如疤痕/痣/饰品"],"wardrobe":"服装","voice":"音色与语速","emotion":"本片中的主要情绪基调"}],
- "shots":[{"id":"sh001","action_en":"英文画面与表演描述，具体到可拍摄","shot_size_en":"英文景别描述","camera_move_en":"英文运镜描述","lens_mm":50,"t_stop":"T2.0","light_key":"主光动机（画面内的光源）","light_quality":"soft|hard|diffused","light_direction":"光位如 camera-left three-quarter back","light_ratio":"光比如 8:1","color_temp":3200,"composition":"构图规则","subject_position":"主体位置","emotion":"情绪基调","note":"衔接与连续性说明","characters":["出场角色名"]}]}
+ "shots":[{"id":"sh001","action_en":"英文画面与表演描述，具体到可拍摄","shot_size_en":"英文景别描述","camera_move_en":"英文运镜描述","lens_mm":50,"t_stop":"T2.0","light_key":"主光动机（画面内的光源）","light_quality":"soft|hard|diffused","light_direction":"光位如 camera-left three-quarter back","light_ratio":"光比如 8:1","color_temp":3200,"composition":"构图规则","subject_position":"主体位置","emotion":"情绪基调","note":"衔接与连续性说明","scene_state":"环境状态变体 slug（只能取场次状态清单里的值；仍处于场次初始状态时留空字符串）","mouth_visibility":"visible|covered|offscreen（有画面内台词必须声明；没有画面内台词留空字符串）","shot_size":"景别修正（中文枚举，一般留空 = 沿用分镜；仅在口型风险必须改景别时填）","characters":["出场角色名"]}]}
 
 硬性要求：
 1. shots 必须与给定分镜**逐个对应**（相同 id、相同顺序、数量一致），不得增删；
 2. characters 必须覆盖角色圣经中所有角色，且 appearance 细节比圣经更具体（这是同一个人跨镜头不变形的依据）；
 3. 照明必须有明确的画面内动机（窗户/台灯/屏幕/火光），禁止"无来源的均匀补光"——那是最明显的 AI 感；
 4. lens_mm 按景别选择（大远景 24 / 远景 32 / 全景 40 / 中景 50 / 近景 65 / 特写 85 / 大特写 100）；
-5. 只输出 JSON。`
+5. scene_state 只在下方给出「场次环境状态清单」时才能填，且必须是该场次声明过的 slug；
+   本镜画面环境仍处于场次初始状态就留空。填了系统就会拿该状态的美术基准图作为本镜的
+   环境锚——状态与环境描述不符的锚点会带偏整镜画面（如"云层散尽"的镜头拿"雷云蔽日"的基准）；
+6. mouth_visibility：说话人嘴部在画面里的可见性，这是口型穿帮的确定性下限——生成端是无声
+   生成、配音在后期叠加，口型与台词必然对不上，只有"让观众看不见嘴在说话"才能规避：
+   · 有画面内台词（说话人不是 narrator）的镜头**必须**声明 visible / covered / offscreen；
+   · visible = 嘴部清晰可见；covered = 侧脸/背身/前景遮挡/虚焦，看不见嘴；offscreen = 说话人不在画内（画外音）；
+   · **visible 不允许搭配 特写/大特写**（会被拒绝）：正对嘴部的特写是穿帮的最坏形态。请把台词
+     改由看不见嘴的构图承载（听者反应镜头、过肩、侧脸、前景遮挡、手部/道具大特写、说话人出画），
+     在 composition 里写明遮挡方式，并声明 covered/offscreen；
+   · 没有画面内台词的镜头必须留空字符串；
+7. shot_size：一般必须留空（沿用分镜景别）。仅在"说话人嘴部可见 + 特写/大特写"且无法用构图规避时，
+   才用它在枚举内修正景别（如 中景/近景）；代码会据此重算 shot_size_en 与镜头焦段；
+8. 只输出 JSON。`
 		user := "创作意图：" + ctx.Brief +
 			"\n剧本：" + marshal(script) +
 			"\n分镜表（shots 必须与之一一对应）：" + marshal(sb) +
 			"\n角色圣经（characters 必须覆盖）：" + marshal(bible) +
 			"\n建议整体风格：" + preset.Name + "（" + style.Name + "）"
+		if len(statesByScene) > 0 {
+			user += "\n场次环境状态清单（scene_state 只能取这里的值，其余镜头留空）：" + marshal(statesByScene)
+		}
 		if err := callJSON(ctx, "shotspec", system, user, out); err != nil {
 			return nil, err
 		}
@@ -195,6 +321,7 @@ schema：
 
 	for _, sh := range sb.Shots {
 		o, _ := findShot(out.Shots, sh.ID)
+		var specMouthDecl string // 模型声明的嘴部可见性（节拍构建后校验）
 		spec := promspec.ShotSpec{
 			ID: sh.ID, SceneID: sh.SceneID, Location: sh.Location,
 			Description: sh.Description, ShotSize: sh.ShotSize, CameraMove: sh.CameraMove,
@@ -231,9 +358,19 @@ schema：
 			}
 			spec.Emotion = o.Emotion
 			spec.Continuity = o.Note
+			st, serr := validateSceneState(sh.ID, sh.SceneID, o.SceneState, statesByScene)
+			if serr != nil {
+				return nil, serr
+			}
+			spec.SceneState = st
 			if len(o.Characters) > 0 {
 				spec.Characters = intersect(o.Characters, sh.Characters, bible)
 			}
+			// 景别修正放在全部覆盖之后：它要压过分镜的枚举值（口型风险时才允许）
+			if serr := resolveShotSize(&spec, o.ShotSize); serr != nil {
+				return nil, serr
+			}
+			specMouthDecl = o.MouthVisibility
 		}
 		if spec.ActionEn == "" {
 			spec.ActionEn = sh.Description
@@ -253,6 +390,18 @@ schema：
 		// ---- 台词绑定：把台本逐句挂到镜头节拍上（字幕与配音的唯一依据）----
 		var dialogueSec float64
 		lines := linesByShot[sh.ID]
+		for _, l := range lines {
+			dialogueSec += srt.EstimateSpeakSec(l.Text)
+		}
+		// 台词比镜头长 → 确定性修复：延长镜头容纳台词。
+		// 台本是唯一真源（不可改写），分镜已人工确认——自修复让模型"精简台词或
+		// 延长镜头"属于不可执行动作（schema 里没有 duration，台本文本必须逐句
+		// 原样绑定），只会烧光 3 轮重试后以同样原因失败
+		if dialogueSec > spec.DurationSec*1.15 {
+			newDur := math.Ceil(dialogueSec/1.15*2) / 2
+			ctx.Log("  ↻ 镜头 %s 时长 %.1fs → %.1fs（容纳台词约 %.1fs）", sh.ID, spec.DurationSec, newDur, dialogueSec)
+			spec.DurationSec = newDur
+		}
 		at := 0.0
 		for _, l := range lines {
 			kind := "dialogue"
@@ -260,15 +409,14 @@ schema：
 				kind = "narration"
 			}
 			sec := srt.EstimateSpeakSec(l.Text)
-			dialogueSec += sec
 			spec.Beats = append(spec.Beats, promspec.Beat{
 				Kind: kind, Speaker: l.Speaker, Text: l.Text,
 				AtSec: at, Emotion: l.Emotion,
 			})
 			// 台词在镜头内的排布：留出入口LeadIn，避免"话音未落画面已切"
 			at += sec + 0.25
-			if at > sh.DurationSec {
-				at = sh.DurationSec
+			if at > spec.DurationSec {
+				at = spec.DurationSec
 			}
 		}
 		// 无台词的镜头补一个动作节拍，保证 video_prompt 里有可执行的表演描述
@@ -278,6 +426,11 @@ schema：
 			})
 		}
 		spec.DialogueSec = dialogueSec
+		// 口型风险门禁必须放在节拍构建之后：判定依据是"画面内说话人"（旁白不算），
+		// 而发声人信息在节拍里。
+		if merr := applyMouthVisibility(&spec, specMouthDecl, ctx.Log); merr != nil {
+			return nil, merr
+		}
 
 		// 优先级与风险：决定渲染顺序（先渲关键/高风险镜头，尽早发现问题）
 		spec.Priority = priorityOf(spec, script)
@@ -288,6 +441,24 @@ schema：
 	// ---- 校验：这是"字幕与台词对得上"的确定性保障 ----
 	if err := validateShotSpec(kit, sb, vo); err != nil {
 		return nil, err
+	}
+	// 口型风险汇总：visible 的台词镜头就是"若将来上口型重对，要重对哪些镜"的工作清单；
+	// 打成一行，避免用户在成片里才发现"说话镜头正对着嘴"。
+	var lines, mvVisible, mvSafe int
+	for _, s := range kit.ShotList {
+		if len(s.SpeakingCharacters()) == 0 {
+			continue
+		}
+		lines++
+		if s.MouthVisibility == "visible" {
+			mvVisible++
+		} else {
+			mvSafe++
+		}
+	}
+	if lines > 0 {
+		ctx.Log("  👄 有台词的镜头 %d 个：嘴部可见 %d（生成端无声生成、配音后期叠加，口型必然对不上——靠构图让观众看不出）· 已规避 %d（covered/offscreen）",
+			lines, mvVisible, mvSafe)
 	}
 	return kit, nil
 }
@@ -464,10 +635,21 @@ func mockShotSpec(bible CharacterBible, sb Storyboard) *shotSpecOut {
 			SubjectPos:     "subject on the left third",
 			Emotion:        "tense",
 			Note:           "keep screen direction consistent with the previous shot",
-			Characters:     sh.Characters,
+			// 离线演示同样走口型门禁：有画面内台词的镜头声明"看不见嘴"的构图
+			// （见 applyMouthVisibility）——mock 与真实链路判分口径一致才可信。
+			MouthVisibility: mockMouthVisibility(sh),
+			Characters:      sh.Characters,
 		})
 	}
 	return out
+}
+
+// mockMouthVisibility 离线演示的嘴部可见性：有角色出镜的镜头按"看不见嘴"处理。
+func mockMouthVisibility(sh Shot) string {
+	if len(sh.Characters) > 0 {
+		return "covered"
+	}
+	return ""
 }
 
 // ShotSpecKit 供渲染端读取类型（编译期保证结构一致）。

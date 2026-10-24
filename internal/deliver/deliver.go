@@ -166,8 +166,9 @@ func Run(cfg *config.Config, opt Options) (*Report, error) {
 	if opt.VisualCheck && opt.VisionClient != nil {
 		vrep, verr := vision.Run(cfg, vision.Options{RunDir: opt.RunDir, Client: opt.VisionClient})
 		if verr != nil {
-			fmt.Printf("  ⚠ 视觉复核未完成（不影响交付）: %v\n", verr)
-			rep.Warnings = append(rep.Warnings, "视觉复核未完成: "+verr.Error())
+			// 严格模式：复核已启用就必须查完——"未完成"不交付，
+			// 不允许"以为查过、其实没查"（确需跳过请显式 --no-visual）。
+			return rep, fmt.Errorf("视觉复核未完成，拒绝交付: %w", verr)
 		} else {
 			rep.VisualQA = vrep
 			fmt.Printf("  👁 视觉复核：%d 个镜头均分 %.1f（模型 %s）\n",
@@ -232,13 +233,12 @@ func Run(cfg *config.Config, opt Options) (*Report, error) {
 	}
 	release := filepath.Join(outDir, "final_release.mp4")
 	if burn && subPath != "" {
+		// 严格模式：要求烧录就必须烧成——失败即失败，不静默降级为外挂字幕。
+		// 确需无字幕母版请显式 --no-burn。
 		if err := burnSubtitles(cfg, opt.RunDir, withAudio, subPath, release); err != nil {
-			rep.Warnings = append(rep.Warnings,
-				"字幕烧录失败（成片仍可交付，字幕以外挂 SRT 形式提供）: "+err.Error())
-			release = withAudio
-		} else {
-			rep.Subtitle.Burned = true
+			return rep, fmt.Errorf("字幕烧录失败（如需无字幕母版请显式 --no-burn）: %w", err)
 		}
+		rep.Subtitle.Burned = true
 	} else {
 		release = withAudio
 		if subPath != "" {
@@ -364,8 +364,8 @@ func orderShots(runDir string, kit *promspec.Kit, man *manifestDoc) ([]shotClip,
 //
 // editplan.json 里标注的转场（开场淡入 / 场景切换叠化）在这里真正落地：
 // 叠化采用"时间轴守恒"实现（见 transitions.go），成片总时长不变，
-// 字幕与配音的实测时间轴不受影响。editplan 缺失或 ffmpeg 缺少 xfade/tpad
-// 滤镜时自动退回纯硬切（旧行为），绝不因此交付失败。
+// 字幕与配音的实测时间轴不受影响。严格模式：配置了转场但环境缺少
+// xfade/tpad 滤镜时直接失败，不静默退回硬切。
 func concatShots(cfg *config.Config, opt Options, kit *promspec.Kit, clips []shotClip, out string) error {
 	if len(clips) == 0 {
 		return fmt.Errorf("没有任何可合成的镜头片段")
@@ -380,11 +380,10 @@ func concatShots(cfg *config.Config, opt Options, kit *promspec.Kit, clips []sho
 	}
 
 	tc := cfg.Transitions
-	if !ffx.HasFilter("xfade") {
-		if tc.Enabled {
-			fmt.Println("  ⚠ 当前 ffmpeg 缺少 xfade 滤镜：转场降级为硬切（建议升级 ffmpeg 4.3+）")
-		}
-		tc.Enabled = false
+	// 严格模式：配置了转场就必须能做出转场——静默退回硬切会让
+	// editplan 的 fade_in/dissolve 方案变成"写完就扔的死数据"
+	if tc.Enabled && (!ffx.HasFilter("xfade") || !ffx.HasFilter("tpad")) {
+		return fmt.Errorf("transitions.enabled=true 但当前 ffmpeg 缺少 xfade/tpad 滤镜：请升级 ffmpeg（4.3+），或显式关闭 transitions 后重跑")
 	}
 
 	// 宽银幕交付：Style.Aspect 宽于交付容器时按该画幅中心裁切 + letterbox
@@ -397,10 +396,14 @@ func concatShots(cfg *config.Config, opt Options, kit *promspec.Kit, clips []sho
 	}
 
 	// 镜头间曝光匹配：实测各镜亮度对齐全片中位数（生成端逐镜漂移的直接对策）。
-	// 失败/关闭时安静跳过，绝不因此阻断交付。
+	// 严格模式：测量失败即失败，不静默跳过（跳过 = 成片保留镜头间闪烁）。
 	var lumaAdj []float64
 	if tc.MatchExposureEnabled() && len(clips) > 1 {
-		lumaAdj = shotLumaOffsets(clips)
+		var lerr error
+		lumaAdj, lerr = shotLumaOffsets(clips)
+		if lerr != nil {
+			return lerr
+		}
 		applied := 0
 		maxAdj := 0.0
 		for _, v := range lumaAdj {
@@ -447,13 +450,13 @@ func buildNarration(client *ai.Client, cfg *config.Config, opt Options, kit *pro
 	if client == nil {
 		return "", nil, nil, nil
 	}
-	plan, err := narrate.Run(client, cfg, narrate.Options{RunDir: opt.RunDir, Workers: opt.Workers})
+	plan, err := narrate.Run(client, cfg, narrate.Options{
+		RunDir: opt.RunDir, Workers: opt.Workers, AllowIncomplete: opt.AllowIncomplete,
+	})
 	if err != nil {
-		// 没有台本时不应阻断画面交付，但要显式降级
-		if os.IsNotExist(err) || strings.Contains(err.Error(), "台本") {
-			return "", nil, nil, nil
-		}
-		return "", nil, nil, err
+		// 严格模式：要配音就必须配音成功——缺台本/任一环节失败都直接失败，
+		// 不静默产出"无对白"的片子。确需只交付画面请显式 --skip-audio。
+		return "", nil, nil, fmt.Errorf("配音失败（如需只交付画面请显式 --skip-audio）: %w", err)
 	}
 	total, err := audio.ProbeDuration(videoMaster)
 	if err != nil {
@@ -469,9 +472,15 @@ func buildNarration(client *ai.Client, cfg *config.Config, opt Options, kit *pro
 		})
 	}
 	// BGM 自动化：在扫描素材之前保证 output/music/ 有货——
-	// 曲库按 cue 自动选曲（零成本），曲库无匹配时可走生成 API。逐条告警如实上报。
+	// 曲库按 cue 自动选曲（零成本），曲库无匹配时可走生成 API。
+	// 严格模式：供给过程本身的失败（生成/复制/落盘）直接失败；
+	// 曲库无匹配素材属于缺输入，逐条告警如实上报。
 	var musicWarns []string
-	for _, w := range ensureMusic(client, cfg, opt.RunDir) {
+	warns, merr := ensureMusic(client, cfg, opt.RunDir)
+	if merr != nil {
+		return "", nil, nil, merr
+	}
+	for _, w := range warns {
 		fmt.Printf("  ⚠ %s\n", w)
 		musicWarns = append(musicWarns, w)
 	}
@@ -651,15 +660,11 @@ func burnSubtitles(cfg *config.Config, runDir, video, srt, out string) error {
 		"-c:a", "copy", "-movflags", "+faststart", out); err == nil {
 		return nil
 	}
-	// 路径 C：不指定字体（某些环境缺少配置的字体，缺字体会让 subtitles 滤镜直接失败）
-	styleLite := fmt.Sprintf("FontSize=%d,Outline=%d,MarginV=%d,Alignment=2",
-		cfg.Subtitle.FontSize, maxInt(1, cfg.Subtitle.OutlineWidth), cfg.Subtitle.MarginV)
-	_, err := ffx.RunIn(dir, 60*time.Minute, "ffmpeg", "-hide_banner", "-y",
-		"-i", video,
-		"-vf", "subtitles="+name+":force_style='"+styleLite+"'",
-		"-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
-		"-c:a", "copy", "-movflags", "+faststart", out)
-	return err
+	// 严格模式：不提供"丢弃字体"的兜底路径——缺字体会让 subtitles 滤镜失败，
+	// 但静默换字体是画面级劣化（字幕排版是交付物的一部分）。
+	// 两条路径（切目录 / 绝对路径转义）试完仍失败即失败，请安装配置的字体后重跑。
+	return fmt.Errorf("字幕烧录失败：已尝试两种路径（相对路径与绝对路径转义）；"+
+		"常见原因：缺少配置字体 %q（subtitle.font）或 ffmpeg 无 subtitles 滤镜", cfg.Subtitle.Font)
 }
 
 func escapeFilterPath(p string) string {

@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -40,59 +41,82 @@ type dashScopeImageResp struct {
 
 var reAnyImageURL = regexp.MustCompile(`"(?:url|image)"\s*:\s*"(https?://[^"]+)"`)
 
+// MaxEditRefs 多参考图单次请求上限（Seedream 上限 10、Qwen-Edit 2509 为 3-4，取保守值）。
+// 调用方据此预判哪些参考图会真的随请求发出（"声明了却没发出去"是比截断更坏的事）。
+const MaxEditRefs = 4
+
 // ImageEditSupported 当前端点是否配置了受支持的多参考图服务。
 func ImageEditSupported(baseURL string) bool {
-	low := strings.ToLower(baseURL)
-	return strings.Contains(low, "volces.com") || strings.Contains(low, "ark.") ||
-		strings.Contains(low, "dashscope")
+	return isArkEndpoint(baseURL) || strings.Contains(strings.ToLower(baseURL), "dashscope")
 }
 
 // ImageEditMulti 多参考图生成：refs 为参考图（URL 或 data URL），返回图片 URL 与实际模型。
+// callName 是操作类型（业务调用名，如 render.shot_image_edit），进调用记录。
 //
 // 路由规则：
 //   - base_url 含 volces.com/ark → 火山方舟 Seedream（POST /api/v3/images/generations）
 //   - base_url 含 dashscope     → 阿里百炼 Qwen-Image-Edit（POST /api/v1/services/aigc/multimodal-generation/generation）
 //
 // 调用方负责在失败时降级回单参考帧/纯文生图路径——该能力是增强，不是依赖。
-func (c *Client) ImageEditMulti(prompt string, refs []string, opt ImageOptions) (string, string, error) {
+func (c *Client) ImageEditMulti(callName, prompt string, refs []string, opt ImageOptions) (string, string, error) {
+	span, rec, done, fail := beginCall(KindImage, callName, opt.Model)
+	rec.Mock = c.cfg.Mock
+	rec.Request = &CallRequest{
+		Prompt: truncateCall(prompt), Size: opt.Size, Quality: opt.Quality,
+		RefImages: len(refs),
+	}
+	finish := func(url, model string, err error) (string, string, error) {
+		if err != nil {
+			fail(err)
+			return "", "", err
+		}
+		done(&CallResponse{URL: url, Model: model})
+		return url, model, nil
+	}
 	if c.cfg.Mock {
-		return "mock://image", opt.Model, nil
+		return finish("mock://image", opt.Model, nil)
 	}
 	if len(refs) == 0 {
-		return "", "", fmt.Errorf("多参考图生成需要至少一张参考图")
+		return finish("", "", fmt.Errorf("多参考图生成需要至少一张参考图"))
 	}
-	if len(refs) > 4 {
-		refs = refs[:4] // Seedream 上限 10、Qwen-Edit 2509 为 3-4；取保守值
+	if len(refs) > MaxEditRefs {
+		refs = refs[:MaxEditRefs] // Seedream 上限 10、Qwen-Edit 2509 为 3-4；取保守值
+	}
+	// 截断后再登记：存档的必须是真实随请求发出的那几张
+	for _, ref := range refs {
+		addRequestImage(rec, "ref_image", ref)
 	}
 	model := opt.Model
 	if model == "" {
 		model = c.cfg.Model
 	}
+	rec.Model = model
+	ctx := span.ctx(c.Context())
 	low := strings.ToLower(c.cfg.BaseURL)
 	// 预算预留包住整次编辑调用（与出图同价口径）
 	if err := c.reserve("images.edit", c.estImageCost()); err != nil {
-		return "", model, err
+		return finish("", model, err)
 	}
 	var data []byte
 	var err error
 	if strings.Contains(low, "dashscope") {
-		data, err = c.imageEditDashScope(prompt, refs, model)
+		data, err = c.imageEditDashScope(ctx, prompt, refs, model)
 	} else {
-		data, err = c.imageEditArk(prompt, refs, opt.Size, model)
+		data, err = c.imageEditArk(ctx, prompt, refs, opt.Size, model)
 	}
 	c.settle(c.estImageCost())
 	if err != nil {
-		return "", model, err
+		return finish("", model, err)
 	}
 	if url := parseEditImageURL(data); url != "" {
 		c.chargeImage()
-		return url, model, nil
+		return finish(url, model, nil)
 	}
-	return "", model, fmt.Errorf("多参考图生成返回空结果: %s", truncateForLog(data))
+	return finish("", model, fmt.Errorf("多参考图生成返回空结果: %s", truncateForLog(data)))
 }
 
 // imageEditArk 火山方舟 Seedream：image 字段为数组，size 用档位词（1K/2K/4K）。
-func (c *Client) imageEditArk(prompt string, refs []string, sizeHint, model string) ([]byte, error) {
+func (c *Client) imageEditArk(ctx context.Context, prompt string, refs []string, sizeHint, model string) ([]byte, error) {
 	size := "2K"
 	if s := parseEditSize(sizeHint); s != "" {
 		size = s
@@ -105,11 +129,11 @@ func (c *Client) imageEditArk(prompt string, refs []string, sizeHint, model stri
 		"size":            size,
 		"watermark":       false,
 	})
-	return c.post("/api/v3/images/generations", body)
+	return c.postCtx(ctx, arkAPIPath(c.cfg.BaseURL, "/images/generations"), body)
 }
 
 // imageEditDashScope 百炼 Qwen-Image-Edit：content 交替 image/text 的多模态消息。
-func (c *Client) imageEditDashScope(prompt string, refs []string, model string) ([]byte, error) {
+func (c *Client) imageEditDashScope(ctx context.Context, prompt string, refs []string, model string) ([]byte, error) {
 	content := make([]map[string]string, 0, len(refs)+1)
 	for _, r := range refs {
 		content = append(content, map[string]string{"image": r})
@@ -124,7 +148,7 @@ func (c *Client) imageEditDashScope(prompt string, refs []string, model string) 
 		},
 		"parameters": map[string]any{"watermark": false},
 	})
-	return c.post("/api/v1/services/aigc/multimodal-generation/generation", body)
+	return c.postCtx(ctx, "/api/v1/services/aigc/multimodal-generation/generation", body)
 }
 
 // parseEditImageURL 宽容解析：先按两家已知结构取，失败则正则兜底。

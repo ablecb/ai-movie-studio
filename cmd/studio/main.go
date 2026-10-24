@@ -77,6 +77,12 @@ func main() {
 		err = cmdLessons()
 	case "probe-ref":
 		err = cmdProbeRef(os.Args[2:])
+	case "assets":
+		err = cmdAssets(os.Args[2:])
+	case "backfill-calls":
+		err = cmdBackfillCalls(os.Args[2:])
+	case "serve":
+		err = cmdServe(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -111,6 +117,12 @@ func usage() {
   studio lessons                                # 查看经验记忆库
   studio probe-ref [--out runs/probe-ref]       # 参考图生效性探针（花几分钱实测出图接口
                                                 #   是否真的吃参考图，决定一致性走哪条路）
+  studio serve [--addr 127.0.0.1:8787]          # Web 控制台：按业务模块（创作/渲染/声音/
+                                                #   交付/质检/运行/系统）在浏览器里操作流水线
+  studio assets  --run runs/run-xxx             # 素材库：基于剧本生成一致性素材（角色参考帧 +
+                                                #   场景 establishing 图）；--chars/--scenes 定点重出
+  studio backfill-calls [--dry-run]             # 历史调用记录补档：反查归档"当时随请求发出的图"
+                                                #   （首帧/尾帧/参考帧），旧记录详情页即可回看；先停 serve
 
 环境变量:
   AI_API_KEY     大模型 API 密钥（未设置时进入 mock 离线演示模式）
@@ -162,11 +174,22 @@ func newClient(cfg *config.Config) *ai.Client {
 		BaseURL: cfg.BaseURL, APIKeyEnv: cfg.APIKeyEnv, APIKey: cfg.APIKey(), Model: cfg.Model,
 		Temperature: cfg.Temperature, MaxTokens: cfg.MaxTokens, Mock: cfg.Mock,
 	})
+	ai.EnableByEnv() // AI 调用记录（logs/ai_calls/，AI_CALL_LOG=off 可停用）
 	ac.SetParentContext(rootCtx)
 	ac.SetPrices(priceMap(cfg))
 	ac.SetBudget(cfg.Budget.MaxCostCNY)
 	ac.SetWarnRatio(cfg.Budget.WarnRatio)
 	return ac
+}
+
+// newTextClient 构造面向文本能力的客户端（技能阶段的大脑）。
+//
+// providers.text 指向与顶层不同的端点时（如 config.deepseek.json：文本走 DeepSeek、
+// 画面仍走智谱），文本调用必须派生到该端点——否则模型名与端点错配，
+// 请求会带着 deepseek-flash 打到智谱并报"模型不存在"。
+func newTextClient(cfg *config.Config) (*ai.Client, error) {
+	base := newClient(cfg)
+	return shotkit.CapClient(base, cfg, ai.CapText, cfg.Providers.Text, cfg.Providers.Text.Model)
 }
 
 // priceMap 把配置单价转成客户端可用的计价表。
@@ -246,12 +269,16 @@ func cmdRun(args []string) error {
 		}
 	}
 
-	ac := newClient(cfg)
-	fmt.Printf("⚙ 生效配置: %s\n", cfg.String())
-	e, err := engine.NewRun(wf, ac, newMemory(), "runs")
+	ac, err := newTextClient(cfg)
 	if err != nil {
 		return err
 	}
+	fmt.Printf("⚙ 生效配置: %s\n", cfg.String())
+	e, err := engine.NewRun(wf, ac, cfg, newMemory(), "runs")
+	if err != nil {
+		return err
+	}
+	ai.SetCallScope(e.State.ID) // 调用记录关联到本项目
 	release, err := fsx.LockRun(e.Dir)
 	if err != nil {
 		return err
@@ -263,6 +290,8 @@ func cmdRun(args []string) error {
 func cmdResume(args []string) error {
 	fs := flag.NewFlagSet("resume", flag.ExitOnError)
 	rf := parseRunFlags(fs)
+	until := fs.String("until", "", "跑到指定阶段后停止（配合断点续跑做分段确认）")
+	from := fs.String("from", "", "从此阶段开始重跑（该阶段与已完成的下游重置为待执行）；配合 --until 同阶段可只重跑单个阶段")
 	fs.Parse(args)
 	if rf.runDir == "" {
 		return fmt.Errorf("resume 需要 --run runs/run-xxx")
@@ -272,9 +301,35 @@ func cmdResume(args []string) error {
 	if err != nil {
 		return err
 	}
-	e, err := engine.Resume(rf.runDir, wf, newClient(cfg), newMemory())
+	ai.SetCallScope(filepath.Base(rf.runDir)) // 调用记录关联到本项目
+	tc, err := newTextClient(cfg)
 	if err != nil {
 		return err
+	}
+	e, err := engine.Resume(rf.runDir, wf, tc, cfg, newMemory())
+	if err != nil {
+		return err
+	}
+	// 重跑某阶段：必须在 Resume 之后（Resume 会先把上次 skipped 翻回 pending，
+	// 顺序颠倒会把"需重做"的标记误翻成待执行，语义就散了）。
+	// until 一并传入：窗口内（≤until）的下游本次直接重跑，窗口外的标记为需重做。
+	if *from != "" {
+		if err := e.RerunFrom(*from, *until); err != nil {
+			return err
+		}
+		if *until == "" {
+			fmt.Printf("▶ 将重跑阶段 %s 及其后续\n", *from)
+		} else if *until == *from {
+			fmt.Printf("▶ 将只重跑阶段 %s（后续阶段已标记为需重做）\n", *from)
+		} else {
+			fmt.Printf("▶ 将从阶段 %s 重跑到 %s（窗口外的下游已标记为需重做）\n", *from, *until)
+		}
+	}
+	if *until != "" {
+		if err := engine.TruncateWorkflow(wf, *until, true); err != nil {
+			return err
+		}
+		fmt.Printf("▶ 将在阶段 %s 后停止（已完成阶段自动跳过）\n", *until)
 	}
 	release, err := fsx.LockRun(e.Dir)
 	if err != nil {
@@ -466,6 +521,7 @@ func cmdRender(args []string) error {
 	if *runDir == "" {
 		return fmt.Errorf("缺少 --run 参数")
 	}
+	ai.SetCallScope(filepath.Base(*runDir)) // 调用记录关联到本项目（渲染）
 	cfg := mustConfig(*configPath)
 	if err := chooseQuality(cfg, *qualityMode); err != nil {
 		return err
@@ -589,13 +645,21 @@ func cmdDeliver(args []string) error {
 	doVisual := (cfg.VisionReview.Enabled || *visual) && !*noVisual
 	var visionClient *ai.Client
 	if doVisual {
-		visionClient = newVisionClient(cfg)
-		if visionClient.Mock() {
-			fmt.Printf("⚠ 视觉复核需要密钥（环境变量 %s）：本次跳过复核\n", cfg.Providers.Vision.APIKeyEnv)
+		visionClient, err = newVisionClient(cfg)
+		if err != nil {
+			return err
+		}
+		if cfg.Mock {
+			// 离线演示（mock）没有真实端点可查：显式跳过复核（显式模式，不是降级）
+			fmt.Println("⚠ 离线演示模式：跳过视觉复核")
 			doVisual = false
+		} else if visionClient.Mock() {
+			// 严格模式：复核已启用就必须能复核——密钥缺失直接失败，
+			// 不允许"以为查过、其实没查"。确需跳过请显式 --no-visual。
+			return fmt.Errorf("视觉复核已启用但缺少密钥（环境变量 %s）：请配置密钥，或用 --no-visual 显式跳过复核",
+				cfg.Providers.Vision.APIKeyEnv)
 		} else if err := visionClient.Ping(); err != nil {
-			fmt.Printf("⚠ 视觉能力探测失败，已跳过复核: %v\n", err)
-			doVisual = false
+			return fmt.Errorf("视觉复核已启用但能力探活失败：%w\n  处理：修复 providers.vision 端点/模型配置，或用 --no-visual 显式跳过复核", err)
 		} else {
 			fmt.Printf("👁 视觉复核已启用: %s\n", visionClient.EndpointInfo())
 		}
@@ -614,12 +678,10 @@ func cmdDeliver(args []string) error {
 //
 // 视觉复核常常与生成端不是同一家服务（例如画面用智谱、复核用 DeepSeek
 // deepseek-flash）。ai.Client.For 会保留同一个花费账本，因此复核花费同样计入预算熔断。
-func newVisionClient(cfg *config.Config) *ai.Client {
+// 严格模式：providers.vision 是独立端点但缺密钥 → 报错（不允许静默继承顶层密钥或退回离线）。
+func newVisionClient(cfg *config.Config) (*ai.Client, error) {
 	base := newClient(cfg)
-	ep := cfg.Providers.Vision
-	return base.For(ai.CapVision, ai.Endpoint{
-		BaseURL: ep.BaseURL, APIKeyEnv: ep.APIKeyEnv, APIKey: cfg.APIKeyFor(ep), Model: cfg.Models.Vision,
-	})
+	return shotkit.CapClient(base, cfg, ai.CapVision, cfg.Providers.Vision, cfg.Models.Vision)
 }
 
 // ---- 参考图生效性探针 ----
@@ -648,6 +710,11 @@ func cmdProbeRef(args []string) error {
 	if ac.Mock() {
 		return fmt.Errorf("参考图探针需要真实 API（当前为离线模式）。请 export AI_API_KEY=<密钥> 后重试")
 	}
+	// 出图能力客户端：端点取 providers.image（探针测的就是这条路的参考图行为）
+	imgc, err := shotkit.CapClient(ac, cfg, ai.CapImage, cfg.Providers.Image, cfg.Image.Model)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
 		return err
 	}
@@ -655,9 +722,9 @@ func cmdProbeRef(args []string) error {
 	fmt.Println("▶ 参考图生效性探针（3 次调用：出图×2 + 视觉复核×1）")
 	refPrompt := "cinematic photo: a vintage red bicycle with a wicker basket leaning against a blue wooden door, warm afternoon light, shallow depth of field"
 	fmt.Println("  1/3 生成参考图（红色自行车+蓝色木门）…")
-	refURL, refModel, err := ac.ImageGenEx(refPrompt, ai.ImageOptions{
+	refURL, refModel, err := imgc.ImageGenEx("probe.ref_image", refPrompt, ai.ImageOptions{
 		Model: cfg.Image.Model, Size: cfg.Image.RefSize, Watermark: cfg.Image.Watermark,
-	}, cfg.Image.FallbackModels)
+	})
 	if err != nil {
 		return fmt.Errorf("参考图生成失败: %w", err)
 	}
@@ -673,10 +740,10 @@ func cmdProbeRef(args []string) error {
 		return err
 	}
 	probePrompt := "the exact same scene, same camera angle, same red bicycle and blue wooden door: the bicycle's front wheel has been removed and leans against the door"
-	probeURL, probeModel, err := ac.ImageGenEx(probePrompt, ai.ImageOptions{
+	probeURL, probeModel, err := imgc.ImageGenEx("probe.image", probePrompt, ai.ImageOptions{
 		Model: cfg.Image.Model, Size: cfg.Image.RefSize, Watermark: cfg.Image.Watermark,
 		RefImage: ref, RefStrength: 0.6,
-	}, cfg.Image.FallbackModels)
+	})
 	if err != nil {
 		return fmt.Errorf("带参考图生成失败: %w", err)
 	}
@@ -686,7 +753,10 @@ func cmdProbeRef(args []string) error {
 	}
 	fmt.Printf("     模型=%s → %s\n", probeModel, probePath)
 
-	vc := newVisionClient(cfg)
+	vc, err := newVisionClient(cfg)
+	if err != nil {
+		return err
+	}
 	if vc.Mock() {
 		fmt.Println("  3/3 视觉复核密钥未配置：请人工对比两图后判断")
 		fmt.Printf("     参考: %s\n     结果: %s\n", refPath, probePath)

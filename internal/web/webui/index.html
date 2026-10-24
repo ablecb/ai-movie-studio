@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 电影工作室 · Studio Console</title>
+<link rel="stylesheet" href="/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-icon">🎬</span>
+      <div>
+        <div class="brand-name">AI 电影工作室</div>
+        <div class="brand-sub">studio console</div>
+      </div>
+    </div>
+    <nav class="menu" id="menu">
+      <a href="#/dashboard" data-page="dashboard"><span class="mi">🏠</span>总览</a>
+      <a href="#/creative"  data-page="creative"><span class="mi">✍️</span>创作中心</a>
+      <a href="#/assets"    data-page="assets"><span class="mi">🖼️</span>素材库</a>
+      <a href="#/render"    data-page="render"><span class="mi">🎞️</span>渲染生成</a>
+      <a href="#/audio"     data-page="audio"><span class="mi">🔊</span>声音字幕</a>
+      <a href="#/delivery"  data-page="delivery"><span class="mi">📦</span>交付成片</a>
+      <a href="#/qa"        data-page="qa"><span class="mi">🔍</span>质检复核</a>
+      <a href="#/runs"      data-page="runs"><span class="mi">🗂️</span>运行管理</a>
+      <a href="#/calls"     data-page="calls"><span class="mi">🧾</span>调用记录</a>
+      <a href="#/system"    data-page="system"><span class="mi">⚙️</span>系统设置</a>
+    </nav>
+    <div class="sidebar-foot" id="sidebar-foot"></div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="topbar-title" id="page-title">总览</div>
+      <div class="topbar-right">
+        <label class="run-label">当前项目</label>
+        <select id="run-select" class="run-select"><option value="">加载中…</option></select>
+        <span id="job-pill" class="job-pill hidden" title="点击查看任务"></span>
+      </div>
+    </header>
+    <main class="view" id="view"><div class="loading">加载中…</div></main>
+  </div>
+</div>
+
+<div id="modal-root"></div>
+<div id="toast-root"></div>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -6,7 +6,8 @@
 ```
 brief（创作意图）
   │
-  ▼  studio run          创作与质检：剧本（结构化：目的/冲突/转折/幕）→ 角色圣经 → 分镜 → 生成规格 → 审片
+  ▼  studio run          创作与质检：剧本（结构化：目的/冲突/转折/幕）→ 角色圣经 → 素材库 → 分镜 → 生成规格 → 审片
+  │                      素材阶段在分镜前产出一致性素材（角色参考帧 + 场景图），渲染直接复用
   │                      产出 shotspec.json（台词/画面/摄影参数的唯一真源）
   ▼  studio render       逐镜头生成：角色参考帧锁脸 → **参考帧先过质检**（对照圣经逐项核对，不合格重出）
   │  [--images-only]       → 参考图+定种出图 → 图生视频
@@ -21,7 +22,39 @@ brief（创作意图）
 
 ---
 
+## Web 控制台（按业务模块操作）
+
+不想记命令时，用内置 Web 控制台在浏览器里操作整条流水线：
+
+```bash
+go build -o bin/studio ./cmd/studio
+./bin/studio serve                # 默认 http://127.0.0.1:8787，自动打开浏览器
+./bin/studio serve --addr 0.0.0.0:8787   # 需要局域网访问时
+```
+
+侧边栏按业务模块划分菜单：
+
+| 模块 | 内容 |
+|---|---|
+| 🏠 总览 | 项目统计、开始一部新片（brief → 创作流水线，支持 `--until` 分段停下）、最近任务 |
+| ✍️ 创作中心 | 工作流阶段流水线视图（含失败原因与修复建议）、剧本/角色圣经/分镜/台词等产物卡片视图、断点续跑 |
+| 🖼️ 素材库 | 基于剧本生成一致性素材：角色参考帧（与渲染同源，图生图锁脸 + 圣经核对质检）与场景 establishing 图（场次美术基准）。**已是流水线正式阶段**（角色圣经后、分镜前自动生成）；页面左侧场景描述、右侧该场景用到的素材；支持按角色·场景定点重出 |
+| 🎞️ 渲染生成 | 渲染操作台（成本预估 → 仅出首帧 → 完整渲染）、镜头缩略图网格（点开看视频/重渲历史/换种种子）、角色参考帧画廊与质检结论、定点重渲、多 Take 对比 |
+| 🔊 声音字幕 | 配音台词逐句试听（实测时长/入点/溢出标记）、字幕预览、配乐 Cue Sheet、混音母版播放 |
+| 📦 交付成片 | 交付选项（视觉复核/无字幕母版/允许缺镜）、成片在线播放与下载、交付报告逐项校验、水印检测结论 |
+| 🔍 质检复核 | 打磨闭环（复核→定点重渲→重交付）、视觉复核分维度评分与逐镜头问题、复核抽帧画廊、隔离区、一键重渲不及格镜头 |
+| 🗂️ 运行管理 | 全部项目列表（阶段/渲染/花费/模式）、Token 用量、任务历史与日志、断点续跑 |
+| ⚙️ 系统设置 | ffmpeg 能力自检 + AI 诊断、内置风格预设、工作流定义、经验记忆库、配置查看（api_key 自动隐藏） |
+
+**设计边界**：Web 层不重新实现流水线——所有付费/重活都以受控子进程调用 `studio` 的
+各子命令执行，运行锁（同一 run 同时只允许一个任务）、断点续跑、预算熔断、失败留痕
+对 Web 发起的任务原样生效。任务实时日志可看、可取消（进程树整树终止）。
+API Key 永不出网：配置查看接口递归掩掉 `api_key` 字段；文件接口拒绝路径穿越与隐藏目录。
+
+---
+
 ## 为什么它不像"AI 生成的"
+
 
 AI 痕迹不是靠提示词里加 `cinematic, 8k, masterpiece` 消除的——那些词恰恰会触发
 AI 学的生成模式（塑料皮肤、糖水 HDR、过度锐化）。本流水线用**工程手段**逐项消除：
@@ -32,11 +65,13 @@ AI 学的生成模式（塑料皮肤、糖水 HDR、过度锐化）。本流水�
 | 塑料皮肤 / 蜡像感 | 模型默认"美化" | 提示词强制正向要求 `visible pores / subsurface scattering / natural asymmetry`，负面固化 `plastic skin / wax figure / poreless skin` |
 | 无来源的均匀补光 | 提示词没写照明动机 | `light_key` 必须是**画面内可见光源**（控制台辉光/窗户/台灯），缺失直接判定校验失败 |
 | 多余手指 / 畸形手 | 手部生成是模型弱项 | 负面按 `anatomy` 分组固化；构图明确 `no crop on face or hands`；视觉复核专项检查 |
-| 镜头运动"飘" | 运动提示词没约束 | `video_prompt` 强制写入 `physically plausible / identity stay locked / no morphing / no speed ramping` |
+| 镜头运动"飘" | 运动提示词没约束 | `video_prompt` 强制写入 `physically plausible / identity stay locked / no morphing / no speed ramping`；首尾帧夹逼把运动终点钉在分镜构图上（`end_frame_anchor`） |
 | 构图不像电影 | 未指定光学参数 | 按景别映射真实镜头：大远景 24mm T2.8 → 特写 85mm T1.8，含景深/眩光/胶片型号 |
 | 画面糊/纯色/过曝 | 生成偶发失败 | **客观质检**用信号处理判定（拉普拉斯方差测清晰度、亮度标准差测纯色、肤色连通域测人脸占比），不合格自动换种重渲 |
 | 糖水片质感（重散景+青橙过饱和） | 模型默认审美 | 负面词组 `look` 固化（heavy bokeh / teal-orange / beauty filter）+ 客观质检**饱和度上限**（夜戏放宽 0.10）双道拦截 |
 | 跨镜头服装道具漂移 | 模型不知道上一镜 | shotspec 的 `continuity` 衔接说明注入每镜提示词（视线/轴线/服装状态），此前该字段只落盘不消费 |
+| 同场戏环境漂移（"换了屋子"） | 每镜独立出图，环境只靠文字描述 | 场次 establishing 基准图**逐镜绑定**（素材库 `assets/scenes`，状态变体经 shotspec 的 `scene_state` 精确命中），出图时与角色参考帧一起喂多参考图模型；视觉复核同步比对同一张基准（`scene` 维度） |
+| 口型对不上台词 | 生成端无声生成、配音后期叠加——两者之间没有任何绑定 | ① 台词原文 + 镜头内时间窗 + 说话人写入 `video_prompt`（"说话"至少有一句话的起止节奏）；② `mouth_visibility` 声明嘴部可见性：**visible 不允许搭配特写/大特写**（正对嘴部是穿帮的最坏形态），台词改由听者反应/过肩/侧脸/前景遮挡/出画等"看不见嘴"的构图承载——与真人电影的正反打语言一致 |
 | 宽银幕感靠嘴说 | 画幅只是提示词 | 交付时按 `Style.Aspect`（2.39:1）中心裁切 + letterbox 进容器——HD scope 标准交付，字幕落在下黑边 |
 | 风格每镜都变 | 每镜独立描述 | 全局 `Style` 预设（机型/胶片/调色/颗粒/光晕）由代码固化，全片统一，逐镜只做变奏 |
 | 平台水印角标 | 生成接口默认加水印 | 出图/视频请求**显式**传 `watermark_enabled: false`（默认 `true` = 加显式+隐式水印）；见下文「水印」 |
@@ -115,6 +150,7 @@ export AI_API_KEY=<你的智谱 Key>
 | `studio polish --run <id> [--rounds 2]` | **打磨闭环**：视觉复核 → 不及格镜头定点重渲 → 重交付，循环到达标（预算熔断全程生效） |
 | `studio takes --run <id> --shots sh003` | 关键镜头**多 take 对比**：备份旧 take → 换种重渲新 take → 并排对比片 + 机器评分；`--pick B` 才切换 |
 | `studio deliver --run <id> --no-burn` | 只出无字幕母版 + 外挂 SRT |
+| `studio assets --run <id>` | **素材库**：生成角色参考帧 + 场景 establishing 图（一致性素材）；`--chars 名` / `--scenes s1` 定点重出，`--force` 强制 |
 | `studio verify --run <id>` | 查看交付报告（每项校验的实测值与判定） |
 | `studio verify --run <id> --render` | 对已生成镜头复跑客观质检 |
 | `studio doctor [--run <id>]` | 环境能力自检 + 失败阶段 AI 诊断 |
@@ -242,10 +278,47 @@ output/sfx/sh003.sfx.wav    挂在对应镜头起点（文件名 = <shot_id>.sfx
 }
 ```
 
-- 配置了但**没有密钥**或端点不受支持时，渲染启动会显式提示"多参考图路径未启用"——
-  不让人误以为双角色已有图像级约束；未配置时静默走单参考帧降级路径。
-- 该路径失败自动降级单参考帧，绝不卡死镜头；走通时模型标识记为 `edit:<model>`。
-- 智谱没有多图参考出图接口，因此该端点默认指向火山方舟；配 `ARK_API_KEY` 即启用。
+- **严格模式**：留空 = 显式走单参考帧路径；一旦配置了端点，渲染启动时端点/密钥必须
+  可用——配置不完整直接**拒绝开工**（不允许"配了等于没配"、双角色静默失去图像级约束）。
+- 该路径失败即镜头失败（由重试/中止处理），不回落单参考帧；走通时模型标识记为 `edit:<model>`。
+- 智谱没有多图参考出图接口，该能力的端点指向火山方舟/阿里百炼。**需在 `config.local.json`
+  配置**（仓库默认 config.json 不预置——它依赖本机专属密钥）；配 `ARK_API_KEY` 即启用。
+- **能力路由**：`providers.<能力>` 覆盖各自端点——文本（创作/规划/翻译）、视觉（复核/质检）、
+  图像、视频、TTS、多参考图（image_edit）、音乐各自独立、可指向不同供应商，共用同一花费账本。
+  严格模式：独立端点缺密钥**直接报错**（不会静默继承顶层密钥、也不会退回离线演示）；
+  想显式关闭多参考图就把 `providers.image_edit` 留空。
+
+## 多模态参考出视频（Seedance 2.x 全模态参考）
+
+首尾帧夹逼把"运动终点"钉死，但视频模型只看到首尾两张图——角色的标准像、场景的美术基准
+都进不了视频请求。Seedance 2.x 的**全模态参考**任务解开了这个限制：一次上传该镜头相关的
+全部参考照片，并在提示词里**逐张声明用途**（官方 `@图像N` / `@imageN` 语法）。
+
+```jsonc
+// config.json：reference_model 配成 Seedance 2.x 即启用（留空退回首尾帧夹逼模式）
+"video": { "reference_model": "doubao-seedance-2-0-260128" }   // 2.5 = doubao-seedance-2-5-260628（30s/50 参考/10bit）
+```
+
+每个镜头发出的参考图与声明（顺序即语义，编号即位置）：
+
+1. **出镜角色标准像**（身份锚）——`@image1 is the standard portrait of 杨戬 … identity stays locked`
+2. **场次 establishing 基准**（环境锚）——`@image2 is the establishing baseline of this scene's location …`
+3. **本镜已定稿首帧**（构图锚）——`@image3 is the approved opening frame of this shot — begin the video from this exact framing`
+
+工程保障：
+
+- **任务类型显式声明**：请求带 `omni_reference_task_type=reference`——不写的话模型按提示词
+  自判，误判成"编辑/延长"（对 ratio/duration 有硬约束）会异步报错；显式声明还把参数校验
+  前置成同步报错，不白等一轮排队。
+- **与首尾帧互斥**：参考任务不发首/尾帧（官方约束），`end_frame_anchor` 的锚点出图自动跳过、
+  不为用不上的图付费；构图控制由第 3 条"首帧参考图声明"承担。链式镜头只有在首帧真的
+  需要生成时才优先走首尾帧路径（首帧已在盘上时，复用的定稿首帧直接当构图锚）。
+- **时长/分辨率照常下发**：`videoDurationFor` 的 5/10s 档位与 `video.size` 的分辨率档
+  同样作用于参考任务（2.0 支持到 15s，2.5 支持到 30s），交付重排不会对不上分镜节奏。
+- **2.x 差异由代码适配**：`generate_audio` 显式关掉（2.x 默认生成音轨，本项目自己做后期）；
+  首尾帧任务（`video.model` 指 2.x 时）首帧显式标 `role=first_frame` 且 `ratio` 强制 `adaptive`。
+- **开通与计费**：Seedance 2.x 需在方舟控制台开通（账户余额 > 200 元或购买资源包）；
+  单价与 1.0 pro 不同，启用后请按控制台报价校准 `pricing.video_per_sec`，否则预算预估失真。
 
 ## 视觉复核（让模型真的看画面）
 
@@ -263,8 +336,9 @@ output/sfx/sh003.sfx.wav    挂在对应镜头起点（文件名 = <shot_id>.sfx
 2. 出图后由视觉模型对照角色圣经**逐项核对**（发型/五官/眼镜/疤痕/服装/皮肤），
    产出 `missing`（圣经有画面没有）与 `drift`（画面有圣经没有，AI 自作主张加戏）；
 3. 不合格自动**换种重出**（`ref_qc.max_rounds`，默认 2 轮，每轮换种子 + 追加修正指令）；
-4. 结论随 `render_manifest.json` 落盘：`pass / corrected / failed / skipped`——
-   **"没查"绝不表现为"通过"**；无视觉密钥或探活失败时显式跳过并告警。
+4. 结论随 `render_manifest.json` 落盘：`pass / corrected`——严格模式下**没有"跳过"**：
+   无视觉密钥或探活失败时**拒绝开工**；重出轮数用尽仍不合格也直接失败
+   （修正角色圣经后 `--force-ref` 重跑）。
 
 ```jsonc
 "ref_qc": { "mode": "strict", "max_rounds": 2 }   // off = 关闭（不建议）
@@ -294,8 +368,8 @@ studio deliver --run runs/<id> --no-visual     # 临时跳过
 
 ### 视觉模型必须支持图片输入
 
-`models.vision` 配错时，`deliver` 的探活会失败并**只打印一行警告就继续交付**——
-结果是"以为查过了、其实没查"，而水印/换脸恰恰只能靠这一步发现。
+`models.vision` 配错时，`deliver` 的探活会失败并**直接报错停止**——
+不再"以为查过了、其实没查"，而水印/换脸恰恰只能靠这一步发现。
 因此项目在**配置自检**里就把它拦住（开工前，而不是交付时）：
 
 ```jsonc
@@ -309,7 +383,7 @@ studio deliver --run runs/<id> --no-visual     # 临时跳过
 | 智谱 | `glm-5.3-flashx` `glm-5.3-flash` `glm-5v-turbo` `glm-4.6v` `glm-4.6v-flash` `glm-4.6v-flashx` `glm-4v-flash` `glm-4.1v-thinking-flashx` `glm-4.1v-thinking-flash` `autoglm-phone` |
 | DeepSeek | `deepseek-flash`（v4-pro 不支持 Vision） |
 
-⚠️ **旧值 `glm-4v-plus` / `glm-4v` 已不在智谱支持列表内**，沿用会让复核被静默跳过。
+⚠️ **旧值 `glm-4v-plus` / `glm-4v` 已不在智谱支持列表内**，沿用会让复核直接失败。
 自检发现时会直接报错并列出可选值，不会让你带着一个不生效的复核跑完全片。
 
 它做的事：从每个镜头抽 3 帧（避开首尾 8%，那里常有过渡伪影）→ 缩到 640px →
@@ -383,11 +457,56 @@ studio deliver --run runs/<id> --config config.deepseek.json
 - 旧名 `deepseek-v4-flash-vision-exp` 仍可调用，但请求由最新 Flash 承接
 
 **提前探活**：`deliver` 在复核前会发一张 1×1 图片验证该端点与模型真的支持视觉
-（`ai.Client.Ping`）。配错模型会在**开工前**就被告知，而不是渲染花完钱之后。
+（`ai.Client.Ping`）。配错模型会在**开工前**就报错停止（严格模式），而不是渲染花完钱之后
+——确需跳过复核请显式 `--no-visual`。
 
 **花费计入同一账本**：复核客户端与生成客户端共享花费账本，
 因此视觉复核的花费同样受 `budget.max_cost_cny` 预算熔断约束——
 不会出现"预算之外的付费出口"。
+
+### 出图 / 出视频走火山方舟（Seedream / Seedance）
+
+默认配置里**出图与出视频已指向火山方舟**（`providers.image` / `providers.video`），
+模型分别是 Seedream 出图与 Seedance 出视频；文本/视觉/TTS 仍走顶层（智谱）。
+两家的协议差异由代码自动适配，配置只改端点与模型名：
+
+```jsonc
+"providers": {
+  "image": { "base_url": "https://ark.cn-beijing.volces.com/api/v3", "api_key_env": "ARK_API_KEY", "model": "doubao-seedream-4-0-250828" },
+  "video": { "base_url": "https://ark.cn-beijing.volces.com/api/v3", "api_key_env": "ARK_API_KEY", "model": "doubao-seedance-1-0-pro-250528" },
+  "image_edit": { "base_url": "https://ark.cn-beijing.volces.com/api/v3", "api_key_env": "ARK_API_KEY", "model": "doubao-seedream-4-0-250828" }
+},
+// base_url 写不写 /api/v3 都兼容（少了会自动补；漏了前缀会得到"空响应体"404，已修）
+"image": { "model": "doubao-seedream-4-0-250828", "size": "2048x1152", "ref_size": "1024x1024" },
+"video": { "model": "doubao-seedance-1-0-pro-250528", "size": "1920x1080", "reference_model": "" }
+```
+
+代码自动处理的差异（无需人工干预）：
+
+| 能力 | 智谱（原路径） | 火山方舟（自动切换） |
+|---|---|---|
+| 出图 | `quality`/`ref_strength`/`watermark_enabled` | `watermark`（默认 true，显式写 false 去水印）；无 `ref_strength`；`size` 自动翻译到合法区间（总像素 ≥ 92.16 万，1248x704 → 2496x1408），画幅保持不变 |
+| 出视频 | `POST /videos/generations` + `/async-result` 轮询 | `POST /api/v3/contents/generations/tasks` + 任务轮询；参数为顶层 JSON 字段（`ratio`/`resolution`/`duration`）；首帧=无 role 的 `image_url`（2.x 系显式 `role=first_frame`）、尾帧=`role=last_frame`、参考图=`role=reference_image`；2.x 首尾帧任务 `ratio` 自动改为 `adaptive`（官方约束）、2.x 参考任务显式发 `omni_reference_task_type=reference`；`video.size` 1920x1080 → `1080p` + `16:9` |
+| 运镜 | vidu 系 `movement_amplitude` | Seedance `camera_fixed`（分镜"固定"→ 钉死机位） |
+
+注意事项：
+
+- **`ARK_API_KEY`**：放在 `config.local.json` 的 `providers.*.api_key`（或环境变量/
+  `ARK_API_KEY`）。严格模式：缺密钥会在开工前直接报错，不会静默退回智谱或离线。
+- **模型要先在方舟控制台开通**：未开通时服务端把"未开通/无权限"和"模型名写错"合并成同一句
+  `InvalidEndpointOrModel.NotFound`——代码会补一条可执行提示（去「开通管理」开通，或把
+  推理接入点 ID `ep-xxxxxxxx` 填进模型字段）。
+- **计费要校准**：`pricing.image_per_shot` / `pricing.video_per_sec` 是预算熔断的依据，
+  请按方舟实际报价填写——否则"预估成本/预算上限"会失真（Seedance 1080p 明显贵于
+  CogVideoX，`budget.max_cost_cny` 也要相应提高）。
+- **成本档位**：视频分辨率由 `video.size` 推导（1920x1080 → 1080p 收费档；
+  改 `1280x720` 即 720p，便宜得多）；`--quality speed` 用 `video.economy_model`。
+- **多角色同框**：`video.reference_model` 配成 Seedance 2.x 模型（如
+  `doubao-seedance-2-0-260128`，需先在方舟「开通管理」开通）即启用**多模态参考出视频**
+  （见下文）；留空则一致性由 `providers.image_edit`（Seedream 多图参考出首帧）+
+  首尾帧夹逼保证。
+- **模型自带音频**：2.x 系 Seedance 默认生成音轨，本项目自己做后期，会在请求里
+  显式关掉（1.x 不发该字段——未知字段会 400）。
 
 控制成本的旋钮（`config.vision_review`）：
 
@@ -488,23 +607,34 @@ studio deliver --run runs/<id> --config config.deepseek.json
 
 - **Go 1.22+**
 - **ffmpeg / ffprobe**：推荐 4.1+ 完整版（[gyan.dev](https://www.gyan.dev/ffmpeg/builds/) essentials/full）
-  - `loudnorm`（4.1+）用于响度归一化；**老构建无此滤镜时会自动降级**为
-    "ebur128 测量 + 增益校正 + 限幅"，并在 `doctor` 中告警
-  - `subtitles` 用于字幕烧录；缺失时字幕以外挂 SRT 交付
+  - `loudnorm`（4.1+）用于响度归一化；**严格模式：缺失即报错**（混音直接失败，
+    不再降级为增益校正），`doctor` 会提前告警
+  - `ffprobe` 必须存在：媒体探测缺失即失败（不再降级为解析 ffmpeg 输出）
+  - `subtitles` 用于字幕烧录；缺失时烧录会失败（显式 `--no-burn` 可只出无字幕母版 + 外挂 SRT）
   - 找不到时按顺序查找：环境变量 → PATH → 项目 `tools/` → 常见安装位置
     （含 Windows 上随软件附带的 ffmpeg）
   - 手工指定：`STUDIO_FFMPEG` / `STUDIO_FFPROBE`
 - **中文字体**（字幕烧录）：默认 `Source Han Sans SC Medium`；
-  若系统没有该字体会自动降级为不指定字体
-- **API Key**：`AI_API_KEY`（智谱 GLM/GLM-Image/CogVideoX/CogTTS；视觉复核默认走 `glm-5.3-flash`）。
+  严格模式：缺字体时字幕烧录直接失败（不再静默丢弃字体）
+- **API Key**：`ARK_API_KEY`（火山方舟：Seedream 出图 / Seedance 出视频，默认走它）
+  与 `AI_API_KEY`（智谱：文本创作 / 视觉复核 `glm-5.3-flash` / TTS）。
   未设置时进入离线演示模式：会用 ffmpeg 生成带噪点的占位素材，
   完整走通质检/字幕/混音/交付链路（便于无 Key 验证流程），但不是真实画面。
-- **视觉复核需要密钥才会实际执行**：`vision_review.enabled=true` 只表示"启用了"，
-  真正判定还要 vision 端点有密钥且探活通过；否则 `deliver` 会明确告警并按"未检查"记入交付报告。
+- **视觉复核启用即必须可用**：`vision_review.enabled=true`（或 `--visual`）时，
+  端点/密钥/探活任一不可用 `deliver` 都会**直接报错**，不再静默跳过；
+  确需跳过请显式 `--no-visual`（离线演示 mock 模式除外，会自动跳过）。
 
 ---
 
 ## 设计要点
+
+**严格模式：不降级，出问题就阻塞。** 流水线不做任何静默降级——模型/端点不可用、
+参考图读不出来、尾帧锚点生成失败、质检不过、缺 ffprobe / loudnorm / xfade、字幕烧录失败、
+BGM 生成失败……一律直接报错停止（重试由镜头级/阶段级重试策略承担，AI 自我修复只有
+"修复重试"与"中止"两种动作，没有"跳过"）。所有"要跳过"都必须是显式的：
+`--no-visual`、`--no-burn`、`--skip-audio`、`transitions.enabled=false`、
+`ref_qc.mode=off`、清空 `providers.image_edit` 等。离线演示（mock）除外——
+它是显式的离线模式，不是降级。
 
 **逐镜头生成，而不是整包生成。** 原实现让模型一次产出全部镜头的提示词，一次 JSON
 解析失败就要重生成全部（实测一次调用 568 秒）。现在提示词按镜头编译并落盘
@@ -559,11 +689,15 @@ Ctrl-C 取消覆盖全部付费出口。
 同时重渲轮追加提示词变体（按轮次循环取），`rerender_rounds` 调到多大都不会退化成
 "悄悄重跑同一提示词"。
 
-**同场景衔接 = 首尾帧夹逼，运镜幅度服从分镜。** 链式衔接不再只"接管首帧"：
-首帧承接上镜末帧（连续性），同时按分镜构图生成一张"尾帧锚点"传给 CogVideoX-3 的
-首尾帧数组（运动被夹在"上镜末态 → 本镜构图"之间，中途不再漂移；模型不支持时自动
-降级单首帧）。参考图生视频路径的运动幅度由运镜枚举映射
-（固定/缓推→small，横移/摇/手持→medium，航拍/升降/环绕→large），不再交给模型自定。
+**首尾帧夹逼（每镜默认），运镜幅度服从分镜。** 每镜生成视频时都按分镜构图生成一张
+"尾帧锚点"，与首帧一起传给 CogVideoX-3 的首尾帧数组——**运动的终点被钉在分镜构图上，
+中途不漂离**（`video.end_frame_anchor`，默认开；严格模式：锚点生成/质检失败即镜头失败，不降级）。
+链式承接的镜头首帧=上镜末帧、尾帧=本镜构图（接缝连续且运动有终点）；无承接的镜头
+（片头/跨场景/定点重渲）首尾两端同为分镜构图，把画面锁死在构图两端。
+代价是每镜多一次出图费（约几角钱），`--dry-run` 的预估已计入。参考图生视频路径
+（vidu）无尾帧概念，走该路径的镜头自动跳过锚点生成。参考图生视频路径的运动幅度由
+运镜枚举映射（固定/缓推→small，横移/摇/手持→medium，航拍/升降/环绕→large），
+不再交给模型自定。
 
 **后期消除"镜头间闪一下"。** 合成时实测各镜平均亮度，对偏差镜头施加小幅 `eq` 校正
 （±0.06 上限，插在裁切与补边之间、不碰 letterbox 黑边）——只拉齐曝光，不抢调色的戏；
@@ -574,7 +708,7 @@ Ctrl-C 取消覆盖全部付费出口。
 **时间轴严格守恒**：叠化占用的 N 秒由 B 侧剩余画面轻微减速（≤1.2×时长）偿还，
 成片总时长不变、下游实测时间轴原样有效。不用"末帧冻结"补长——冻结会在剪入
 下一镜前产生可见停顿，减速收尾则是剪辑里惯用的"缓缓停下"节奏。
-硬切为主、叠化只在场景边界，连续叠化自动降级。
+硬切为主、叠化只在场景边界；连续两处叠化按硬约束自动改为硬切（同一视频流不允许被相邻边界双重消费）。
 
 **宽银幕由画幅保证，不由提示词保证。** 生成端按 16:9 出片（模型对 scope 构图的
 服从度不可靠），交付时按 shotspec 的 `Style.Aspect`（默认 2.39:1）中心裁切并
@@ -594,15 +728,17 @@ cmd/studio/          CLI 入口（run/render/deliver/verify/doctor/resume/status
 internal/config/     生产参数集中配置（模型分层/计费/预算/质检阈值）
 internal/promspec/   工业级提示词 DSL（摄影机语言、角色锚点、负面提示词分组）
 internal/shotkit/    逐镜头生成计划（参考帧、确定性种子、计划自检）
+                    └ assets.go  素材库（场景 establishing 图、译文缓存、索引）
 internal/quality/    客观质检（图像/视频指标与三态判定）
 internal/render/     逐镜头生成流水线（质检→换种重渲→付费熔断）
 internal/narrate/    配音（音色映射、逐句实测、超槽处理、排麦）
 internal/audio/      声音后期（多轨混音、侧链闪避、响度归一化、版本兼容）
 internal/subtitle/   字幕引擎（实测对齐、折行、CPS 限速、排版校验）
 internal/deliver/    交付（完整性门禁、合成、字幕烧录、成片校验、交付报告）
-internal/ffx/        ffmpeg 封装（能力探测、版本兼容、无 ffprobe 降级）
+internal/ffx/        ffmpeg 封装（能力探测、版本兼容、严格预检：缺关键能力即阻塞）
 internal/engine/     工作流引擎（DAG 并行、重试退避、定向返修、断点续跑）
 internal/skills/     10 个创作技能（每个都带本地确定性校验）
 internal/selfheal/   规则预过滤 + AI 诊断 + 经验记忆库
+internal/web/        Web 控制台（REST API + 内嵌前端；任务以受控子进程走 CLI）
 workflows/movie.json 工作流定义
 ```

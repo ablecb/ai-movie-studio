@@ -1,19 +1,22 @@
 {
   "base_url": "https://open.bigmodel.cn/api/paas/v4",
   "api_key_env": "AI_API_KEY",
-  "mock": true,
-  "model": "glm-4.6",
+  "mock": false,
+  "model": "glm-5.3-flash",
   "temperature": 0.8,
-  "max_tokens": 4096,
+  "max_tokens": 32768,
+  "_note_max_tokens": "思考型模型（glm-5.3-flash）的思考计入输出预算：4096 会在素材规划这类长 JSON 调用上被思考耗尽、正文一个字都没写出来（assets.plan 真实失败过两次，两次请求的 max_tokens 都是 4096）。8192 给正文留余量；个别调用仍被截断就继续调大。",
+  "_note_media": "出图与出视频走火山方舟（Seedream 出图 / Seedance 出视频），需要 ARK_API_KEY（config.local.json 的 providers.*.api_key 或环境变量）。严格模式：配了就必须可用，缺密钥会直接拒绝渲染/交付。pricing 里的 image_per_shot / video_per_sec 是按次/秒计费的估算值，请按方舟实际报价校准（预算熔断依赖它）。",
   "models": {
-    "texture": "cogvideox-3",
-    "economy": "cogvideox-3",
+    "texture": "doubao-seedance-1-0-pro-250528",
+    "economy": "doubao-seedance-1-0-pro-250528",
     "vision": "glm-5.3-flash",
-    "text": "glm-4.6",
-    "translate": "glm-4-flash",
+    "text": "glm-5.3-flash",
+    "translate": "glm-5.3-flash",
     "tts": "glm-tts"
   },
   "providers": {
+    "_note": "按能力配置端点。text/vision/tts 留空 = 沿用顶层（智谱）；image/video/image_edit 指向火山方舟。music（如 MiniMax）留空即不启用。严格模式下配了就必须可用：端点缺密钥会直接拒绝渲染。",
     "text": {
       "base_url": "",
       "api_key_env": ""
@@ -23,21 +26,23 @@
       "api_key_env": ""
     },
     "image": {
-      "base_url": "",
-      "api_key_env": ""
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "api_key_env": "ARK_API_KEY",
+      "model": "doubao-seedream-5-0-flash-260915"
     },
     "video": {
-      "base_url": "",
-      "api_key_env": ""
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "api_key_env": "ARK_API_KEY",
+      "model": "doubao-seedance-1-0-pro-250528"
     },
     "tts": {
       "base_url": "",
       "api_key_env": ""
     },
     "image_edit": {
-      "base_url": "https://ark.cn-beijing.volces.com",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
       "api_key_env": "ARK_API_KEY",
-      "model": "doubao-seedream-4-0-250828"
+      "model": "doubao-seedream-5-0-flash-260915"
     },
     "music": {
       "base_url": "",
@@ -70,7 +75,7 @@
       "image_per_shot": 0.1
     },
     "video": {
-      "video_per_sec": 0.2
+      "video_per_sec": 1.25
     },
     "tts": {
       "tts_per_1k_chars": 0.1
@@ -80,40 +85,33 @@
     }
   },
   "budget": {
-    "max_cost_cny": 0,
+    "max_cost_cny": 50,
     "warn_ratio": 0.8,
     "stop_on_no_fund": true
   },
   "video": {
-    "model": "cogvideox-3",
-    "quality_model": "cogvideox-3",
-    "economy_model": "cogvideox-3",
+    "model": "doubao-seedance-1-0-pro-250528",
+    "quality_model": "doubao-seedance-1-0-pro-250528",
+    "economy_model": "doubao-seedance-1-0-pro-250528",
     "default_quality": "quality",
-    "size": "1920x1080",
+    "size": "1280x720",
     "fps": 30,
     "workers": 2,
     "timeout_minutes": 20,
-    "shot_retries": 3,
-    "rerender_rounds": 2,
+    "shot_retries": 2,
+    "rerender_rounds": 0,
     "with_audio": false,
-    "fallback_models": [
-      "cogvideox-3",
-      "cogvideox"
-    ],
     "image_to_image": true,
     "ref_size": "1024x1024",
     "watermark": false,
     "allow_long_takes": true,
     "chain_same_scene": true,
-    "reference_model": "vidu2-reference"
+    "end_frame_anchor": true,
+    "reference_model": "doubao-seedance-2-0-260128"
   },
   "image": {
-    "model": "glm-image",
-    "fallback_models": [
-      "glm-image",
-      "cogview-4"
-    ],
-    "size": "1248x704",
+    "model": "doubao-seedream-5-0-flash-260915",
+    "size": "2048x1152",
     "ref_size": "1024x1024",
     "quality": "",
     "watermark": false
@@ -146,9 +144,6 @@
     "max_speed_up": 1.15,
     "tts_speed": 1.0,
     "tts_emotion": true,
-    "tts_fallback_models": [
-      "cogtts"
-    ],
     "line_gap_sec": 0.28,
     "lead_in_sec": 0.18,
     "target_loudness_lufs": -14

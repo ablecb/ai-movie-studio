@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"aistudio/internal/ai"
+	"aistudio/internal/config"
 )
 
 // Context 一次技能执行的上下文
@@ -22,7 +23,10 @@ type Context struct {
 	// Deps: 依赖阶段的输出（key = 阶段 ID）
 	Deps map[string]json.RawMessage
 
-	AI      *ai.Client
+	AI *ai.Client
+	// Cfg 生产参数（媒体生成/质检阈值/预算）。纯 LLM 创作阶段可忽略；
+	// 媒体类技能（素材生成等）必须依赖它，而不是自己猜配置。
+	Cfg     *config.Config
 	Lessons []string // 从经验记忆库检索到的相关教训，注入提示词
 
 	Log func(format string, args ...any)

@@ -58,6 +58,23 @@ func TestGuardBudgetIncludesInflight(t *testing.T) {
 	}
 }
 
+// 尾帧锚点（每镜一张）必须计入出图预估：不告知的隐性加价违背"付费前预估"的承诺。
+func TestEstimateCountsEndFrameAnchors(t *testing.T) {
+	c := New(Config{Mock: true})
+	c.SetPrices(map[string]Price{
+		CostImage: {ImagePerShot: 0.2},
+		CostVideo: {VideoPerSec: 0.1},
+	})
+	base := c.EstimateVideoCost(10, 50, 0, 0, 0)
+	withAnchors := c.EstimateVideoCost(10, 50, 0, 0, 10)
+	if diff := withAnchors.ImageCNY - base.ImageCNY; diff < 1.99 || diff > 2.01 {
+		t.Fatalf("10 镜尾帧锚点应使出图预估 +2.0 元（0.2×10），实际 +%.2f", diff)
+	}
+	if withAnchors.TotalCNY <= base.TotalCNY {
+		t.Fatal("尾帧锚点应推高总预估")
+	}
+}
+
 func TestWarnFiresOnceAcrossClients(t *testing.T) {
 	c := New(Config{Mock: true})
 	c.SetBudget(10)

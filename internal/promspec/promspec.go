@@ -173,14 +173,24 @@ type ShotSpec struct {
 	Light        LightSetup  `json:"light"`
 	Composition  Composition `json:"composition"`
 	DurationSec  float64     `json:"duration_sec"`
-	Characters   []string    `json:"characters"`   // 出场角色名（引用 characters 产物）
-	Beats        []Beat      `json:"beats"`        // 镜头内节拍（含台词）
-	Emotion      string      `json:"emotion"`      // 情绪基调
-	Continuity   string      `json:"continuity"`   // 与前后镜头的衔接说明（防跳轴/防穿帮）
-	DialogueSec  float64     `json:"dialogue_sec"` // 本地重算：本镜头台词占用秒数
-	Seed         int64       `json:"seed"`         // 本镜头生成种子（重渲时递增，其余不变）
-	Risk         string      `json:"risk"`         // low|medium|high：高风险镜头优先试渲
-	Priority     int         `json:"priority"`     // 关键镜头优先级（先渲关键镜头验证画质）
+	Characters   []string    `json:"characters"` // 出场角色名（引用 characters 产物）
+	Beats        []Beat      `json:"beats"`      // 镜头内节拍（含台词）
+	Emotion      string      `json:"emotion"`    // 情绪基调
+	Continuity   string      `json:"continuity"` // 与前后镜头的衔接说明（防跳轴/防穿帮）
+	// SceneState 本镜的环境状态变体 slug（引用素材规划为该场次声明的状态，如
+	// clouds-dispersed）。空 = 仍处于场次初始状态。渲染时据此选该状态的美术基准图
+	// 作环境锚——高潮段"云层散尽"却拿"雷云蔽日"的基准图当参照，锚点会跟画面打架。
+	SceneState string `json:"scene_state,omitempty"`
+	// MouthVisibility 说话人嘴部在画面中的可见性（visible|covered|offscreen）。
+	// 为什么需要它：生成端是无声生成（音频不进请求）、TTS 在交付期才叠上去，
+	// 口型与配音之间没有任何绑定机制。"嘴清晰可见地在说话"是穿帮的最坏形态；
+	// 用看不见嘴的构图（侧脸/背身/前景遮挡/说话人出画）承载台词则天然规避。
+	// 空 = 本镜无画面内台词（旁白不算）。
+	MouthVisibility string  `json:"mouth_visibility,omitempty"`
+	DialogueSec     float64 `json:"dialogue_sec"` // 本地重算：本镜头台词占用秒数
+	Seed            int64   `json:"seed"`         // 本镜头生成种子（重渲时递增，其余不变）
+	Risk            string  `json:"risk"`         // low|medium|high：高风险镜头优先试渲
+	Priority        int     `json:"priority"`     // 关键镜头优先级（先渲关键镜头验证画质）
 }
 
 // DialogueBeats 返回该镜头的台词节拍（按时间排序）。
@@ -193,6 +203,42 @@ func (s ShotSpec) DialogueBeats() []Beat {
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].AtSec < out[j].AtSec })
 	return out
+}
+
+// dialogueAndNarrationBeats 返回本镜的台词与旁白节拍（按时间排序）。
+// 旁白同样要进视频提示词：不写，模型可能给它配上"说话"的画面与嘴型。
+func (s ShotSpec) dialogueAndNarrationBeats() []Beat {
+	var out []Beat
+	for _, b := range s.Beats {
+		if (b.Kind == "dialogue" || b.Kind == "narration") && strings.TrimSpace(b.Text) != "" {
+			out = append(out, b)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].AtSec < out[j].AtSec })
+	return out
+}
+
+// beatWindow 一个节拍在镜头内的确定性时间窗（秒）：入点取节拍自身，出点取
+// 下一个节拍的入点（同镜最后一个节拍取镜头结束）。渲染期还没有 TTS 实测时长
+// （交付期才有），这是能给到视频模型的、最接近真实节奏的信息。
+func (s ShotSpec) beatWindow(b Beat) (float64, float64) {
+	start := b.AtSec
+	end := s.DurationSec
+	for _, other := range s.Beats {
+		if other.AtSec <= start {
+			continue
+		}
+		if other.AtSec < end {
+			end = other.AtSec
+		}
+	}
+	if end <= start {
+		end = start + 1.0 // 兜底：零长窗口没有节奏信息可言，给一个最小可读窗
+	}
+	if end > s.DurationSec {
+		end = s.DurationSec
+	}
+	return start, end
 }
 
 // HasCharacter 该镜头是否有指定角色出场。
@@ -501,20 +547,52 @@ func VideoPrompt(style Style, s ShotSpec) string {
 
 	var actions []string
 	for _, bt := range s.Beats {
-		if bt.Kind == "dialogue" {
+		// 台词与旁白都不是"动作"：旁白是画外声音，写成动作会让模型给它配画面动作
+		if bt.Kind == "dialogue" || bt.Kind == "narration" {
 			continue
 		}
 		if t := strings.TrimSpace(bt.Text); t != "" {
 			actions = append(actions, t)
 		}
 	}
+	// 有台词的镜头节拍全是台词（见 shotspec 的节拍构建），动作描述会整个缺失——
+	// 那样视频提示词只剩运镜与台词，表演节奏没得可依，模型只能自由发挥。
+	if len(actions) == 0 {
+		if a := strings.TrimSpace(s.ActionEn); a != "" {
+			actions = append(actions, a)
+		}
+	}
 	if len(actions) > 0 {
 		fmt.Fprintf(&b, "Action: %s.\n", strings.Join(actions, " then "))
 	}
-	if len(s.SpeakingCharacters()) > 0 {
-		b.WriteString("Dialogue performance: the speaking character delivers the line with subtle, restrained ")
-		b.WriteString("facial performance and natural micro-expressions; lips move in sync with speech, ")
-		b.WriteString("eye contact and blinks are natural.\n")
+
+	// 台词：说话人 + 原文 + 镜头内时间窗 + 嘴部可见性。
+	//
+	// 为什么必须写进去：生成端是**无声生成**（音频不进请求），不写台词，模型只知道
+	// "画面里有人在说话"，不知道说的是什么、从第几秒到第几秒——嘴型的节奏完全随机；
+	// 写进去至少让它的"说话"有一句话的起止与长度（TTS 实测时长要到交付期才有，
+	// 这里用节拍的镜头内窗口，是渲染期能拿到的确定性节奏）。句末时间取下一个节拍
+	// 的入点，没有后续节拍就取镜头结束。
+	for _, bt := range s.dialogueAndNarrationBeats() {
+		start, end := s.beatWindow(bt)
+		var tag string
+		switch {
+		case IsNarrator(bt.Speaker):
+			tag = "narration, off-screen"
+		case s.MouthVisibility == "covered":
+			tag = "on-screen, mouth not clearly visible"
+		case s.MouthVisibility == "offscreen":
+			tag = "speaker out of frame, off-screen"
+		default:
+			tag = "on-screen, mouth visible"
+		}
+		fmt.Fprintf(&b, "Dialogue line (%s, %.1fs-%.1fs): %s says %q\n", tag, start, end, orDefault(bt.Speaker, "the character"), strings.TrimSpace(bt.Text))
+	}
+	if len(s.dialogueAndNarrationBeats()) > 0 {
+		b.WriteString("Dialogue rules: mouth movement must follow the timing and pacing of the lines above and nothing else; ")
+		b.WriteString("for lines marked off-screen or mouth not clearly visible, do NOT animate visible lip movement — ")
+		b.WriteString("keep the face turned away, out of frame or occluded, with subtle body and facial reaction only; ")
+		b.WriteString("subtle restrained performance, natural micro-expressions, natural eye contact and blinks.\n")
 	}
 	fmt.Fprintf(&b, "Duration: about %.1f seconds of continuous action at real-time speed.\n", s.DurationSec)
 	b.WriteString("Motion constraints (critical for realism): ")

@@ -5,6 +5,7 @@
 package ai
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -106,7 +107,7 @@ func New(cfg Config) *Client {
 	}
 	return &Client{
 		cfg:       cfg,
-		http:      &http.Client{Timeout: 600 * time.Second},
+		http:      &http.Client{Timeout: 1800 * time.Second}, // 思考型模型单次生成可超 10 分钟
 		shared:    &clientShared{usage: map[string]*TokenStat{}, parent: context.Background()},
 		ledger:    newLedger(),
 		prices:    map[string]Price{},
@@ -162,6 +163,15 @@ type chatRequest struct {
 	Messages    []chatMessage `json:"messages"`
 	Temperature float64       `json:"temperature"`
 	MaxTokens   int           `json:"max_tokens"`
+	// Stream 流式输出：思考型模型单次生成可达 10 分钟以上，非流式期间服务器
+	// 零字节返回，会被任意一层空闲超时掐死；流式让首字节几秒内到达且持续有数据
+	Stream        bool            `json:"stream,omitempty"`
+	StreamOptions *chatStreamOpts `json:"stream_options,omitempty"`
+}
+
+// chatStreamOpts 流式请求附带最终 usage（否则流式响应不含 token 用量，无法记账）
+type chatStreamOpts struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type chatMessage struct {
@@ -198,13 +208,8 @@ func (c *Client) ChatOpts(callName, system, user string, opts CallOpts) (string,
 
 // ChatModel 指定模型发起对话。模型分层（创作/结构化/翻译/视觉）都走这里，
 // 保证无论用哪个模型，预算门禁、错误分类、用量记账都一致生效。
+// 每次调用落一条记录到 logs/ai_calls/（模型/操作类型/请求响应/首响与完成时间）。
 func (c *Client) ChatModel(model, callName, system, user string, opts CallOpts) (string, error) {
-	if c.cfg.Mock {
-		return MockRespond(callName), nil
-	}
-	if err := c.guardBudget("chat:" + callName); err != nil {
-		return "", err
-	}
 	if model == "" {
 		model = c.cfg.Model
 	}
@@ -215,49 +220,116 @@ func (c *Client) ChatModel(model, callName, system, user string, opts CallOpts) 
 	if maxTokens <= 0 {
 		maxTokens = c.cfg.MaxTokens
 	}
+	span, rec, done, fail := beginCall(KindChat, callName, model)
+	rec.Mock = c.cfg.Mock
+	rec.Request = &CallRequest{
+		System: truncateCall(system), Prompt: truncateCall(user),
+		Temperature: temp, MaxTokens: maxTokens,
+	}
+	finish := func(text string, err error) (string, error) {
+		if err != nil {
+			fail(err)
+			return "", err
+		}
+		done(&CallResponse{Text: truncateCall(text), Model: model})
+		return text, nil
+	}
+	if c.cfg.Mock {
+		text := MockRespond(callName)
+		return finish(text, nil)
+	}
+	if err := c.guardBudget("chat:" + callName); err != nil {
+		return finish("", err)
+	}
 	reqBody, err := json.Marshal(chatRequest{
-		Model:       model,
-		Messages:    []chatMessage{{Role: "system", Content: system}, {Role: "user", Content: user}},
-		Temperature: temp,
-		MaxTokens:   maxTokens,
+		Model:         model,
+		Messages:      []chatMessage{{Role: "system", Content: system}, {Role: "user", Content: user}},
+		Temperature:   temp,
+		MaxTokens:     maxTokens,
+		Stream:        true,
+		StreamOptions: &chatStreamOpts{IncludeUsage: true},
 	})
 	if err != nil {
-		return "", fmt.Errorf("构造请求失败: %w", err)
+		return finish("", fmt.Errorf("构造请求失败: %w", err))
 	}
 	url := strings.TrimRight(c.cfg.BaseURL, "/") + "/chat/completions"
-	req, err := http.NewRequestWithContext(c.Context(), http.MethodPost, url, bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(span.ctx(c.Context()), http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
-		return "", fmt.Errorf("创建 HTTP 请求失败: %w", err)
+		return finish("", fmt.Errorf("创建 HTTP 请求失败: %w", err))
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Authorization", "Bearer "+c.cfg.Key())
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", ClassifyTransport("chat:"+callName, err)
+		return finish("", ClassifyTransport("chat:"+callName, err))
 	}
 	defer resp.Body.Close()
-
-	body, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		return "", ClassifyTransport("chat:"+callName, readErr)
-	}
 	if resp.StatusCode >= 300 {
-		return "", ClassifyHTTP("chat:"+callName, resp.StatusCode, string(body))
+		body, _ := io.ReadAll(resp.Body)
+		return finish("", ClassifyHTTP("chat:"+callName, resp.StatusCode, string(body)))
 	}
-	var cr chatResponse
-	if err := json.Unmarshal(body, &cr); err != nil {
-		return "", fmt.Errorf("解析响应失败 (HTTP %d): %w", resp.StatusCode, err)
+
+	// SSE 解析：思考型模型生成可达 10 分钟以上，流式让首字节几秒到达且持续有
+	// 数据流动，避免"服务器长时间零字节静默"被任意一层空闲超时掐死
+	var content strings.Builder
+	var usage *usageInfo
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(line[len("data:"):])
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+			Usage *usageInfo `json:"usage,omitempty"`
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error,omitempty"`
+		}
+		if json.Unmarshal([]byte(payload), &chunk) != nil {
+			continue
+		}
+		if chunk.Error != nil {
+			return finish("", ClassifyHTTP("chat:"+callName, resp.StatusCode, chunk.Error.Message))
+		}
+		for _, ch := range chunk.Choices {
+			content.WriteString(ch.Delta.Content)
+		}
+		if chunk.Usage != nil {
+			usage = chunk.Usage
+		}
 	}
-	if cr.Error != nil {
-		return "", ClassifyHTTP("chat:"+callName, resp.StatusCode, cr.Error.Message)
+	if err := scanner.Err(); err != nil {
+		if content.Len() > 0 {
+			return finish("", ClassifyTransport("chat:"+callName,
+				fmt.Errorf("流式响应中断（已收 %d 字符，内容不完整）: %w", content.Len(), err)))
+		}
+		return finish("", ClassifyTransport("chat:"+callName, err))
 	}
-	if len(cr.Choices) == 0 {
-		return "", ClassifyHTTP("chat:"+callName, resp.StatusCode, "响应中没有 choices（可能被内容审核拦截）")
+	text := content.String()
+	if strings.TrimSpace(text) == "" {
+		// 流结束但没有正文：思考型模型的思考计入输出预算，思考未完成即被
+		// max_tokens 截断时正文永远没开始写——按错误处理进自修复
+		return finish("", ClassifyHTTP("chat:"+callName, resp.StatusCode,
+			"模型未输出正文：思考可能超出 max_tokens 被截断（思考型模型），请调大该阶段的输出预算"))
 	}
-	c.recordUsage(callName, cr.Usage)
-	c.recordTokens(costKindFor(callName), c.priceOf(costKindFor(callName)), cr.Usage)
-	return cr.Choices[0].Message.Content, nil
+	if usage != nil {
+		c.recordUsage(callName, usage)
+		c.recordTokens(costKindFor(callName), c.priceOf(costKindFor(callName)), usage)
+		rec.Usage = usage
+	}
+	return finish(text, nil)
 }
 
 // costKindFor 把调用名映射到计费类别，保证视觉/翻译走各自的单价。
@@ -326,6 +398,12 @@ type apiError struct {
 }
 
 func (c *Client) do(method, path string, body []byte) ([]byte, error) {
+	return c.doCtx(c.Context(), method, path, body)
+}
+
+// doCtx 带调用方上下文的请求：调用记录的"首次响应时间"靠 ctx 里的
+// httptrace 回调捕获，媒体调用的多层嵌套（提交/轮询）由此归位到同一条记录。
+func (c *Client) doCtx(ctx context.Context, method, path string, body []byte) ([]byte, error) {
 	if err := c.guardBudget(method + " " + path); err != nil {
 		return nil, err
 	}
@@ -334,7 +412,7 @@ func (c *Client) do(method, path string, body []byte) ([]byte, error) {
 	if body != nil {
 		rd = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(c.Context(), method, url, rd)
+	req, err := http.NewRequestWithContext(ctx, method, url, rd)
 	if err != nil {
 		return nil, fmt.Errorf("创建 HTTP 请求失败: %w", err)
 	}
@@ -363,11 +441,19 @@ func (c *Client) do(method, path string, body []byte) ([]byte, error) {
 }
 
 func (c *Client) post(path string, body []byte) ([]byte, error) {
-	return c.do(http.MethodPost, path, body)
+	return c.doCtx(c.Context(), http.MethodPost, path, body)
+}
+
+func (c *Client) postCtx(ctx context.Context, path string, body []byte) ([]byte, error) {
+	return c.doCtx(ctx, http.MethodPost, path, body)
 }
 
 func (c *Client) get(path string) ([]byte, error) {
-	return c.do(http.MethodGet, path, nil)
+	return c.doCtx(c.Context(), http.MethodGet, path, nil)
+}
+
+func (c *Client) getCtx(ctx context.Context, path string) ([]byte, error) {
+	return c.doCtx(ctx, http.MethodGet, path, nil)
 }
 
 func truncateForLog(b []byte) string {

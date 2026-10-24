@@ -404,18 +404,16 @@ func Mix(req MixRequest, opt Options) (*MixResult, error) {
 		MusicCount: len(musicIdx), SFXCount: len(sfxIdx),
 	}
 	if useLoudnorm {
+		// 严格模式：归一化失败即失败——"保持原混音"会让响度指标静默不达标
 		if err := normalizeTwoPass(req.Out, opt); err != nil {
-			res.Notes = append(res.Notes, "两遍响度归一化未生效（保持原混音）: "+err.Error())
+			return nil, fmt.Errorf("两遍响度归一化失败: %w", err)
 		}
 	} else if opt.SkipNormalize {
 		res.Notes = append(res.Notes, "已跳过响度归一化（SkipNormalize）")
 	} else {
-		// 老构建降级：测量 + 增益校正 + 限幅
-		if err := normalizeWithGain(req.Out, opt); err != nil {
-			res.Notes = append(res.Notes, "响度归一化降级失败: "+err.Error())
-		} else {
-			res.Notes = append(res.Notes, "当前 ffmpeg 无 loudnorm，已用「测量+增益+限幅」降级归一化")
-		}
+		// 严格模式：缺 loudnorm 拒绝降级归一化（「测量+增益+限幅」没有动态范围
+		// 控制，响度看似达标但质感与广播级两遍归一化不同，属于静默的产物劣化）。
+		return nil, fmt.Errorf("当前 ffmpeg 缺少 loudnorm 滤镜，拒绝降级归一化：请升级 ffmpeg（4.1+）；确需跳过归一化请显式设置 SkipNormalize")
 	}
 	// 一律以实测为准：JSON 解析可能受版本输出格式影响
 	if lufs, err := MeasureLoudness(req.Out); err == nil && lufs != 0 {
@@ -442,79 +440,12 @@ func Mix(req MixRequest, opt Options) (*MixResult, error) {
 	return res, nil
 }
 
-// normalizeWithGain 无 loudnorm 时的降级归一化：
-// 测量积分响度与峰值 → 计算增益（受真峰值上限约束）→ 应用增益 + 限幅。
-//
-// 安全护栏（这些护栏来自实战教训）：
-//   - 测量值不可信（低于 -60 LUFS 说明几乎无内容，或测量单元异常）时**放弃归一化**
-//   - 增益上限 +24dB：老构建上测量偏差可能把增益算成 +50dB，
-//     推爆后被限幅器压成静音——"归一化把声音弄没了"比不归一化严重得多
-func normalizeWithGain(path string, opt Options) error {
-	lufs, err := MeasureLoudness(path)
-	if err != nil || lufs == 0 {
-		return fmt.Errorf("无法测量响度: %v", err)
-	}
-	if lufs < -60 {
-		return fmt.Errorf("实测响度 %.1f LUFS 低于可信下限（-60），放弃归一化以免破坏音频", lufs)
-	}
-	peak, perr := PeakDBFS(path)
-	gain := opt.TargetLoudness - lufs
-	useLimit := hasAlimiter()
-	if perr != nil {
-		peak = 0 // 测量失败按无峰值信息处理：有限制器兜底，增益照常应用
-	}
-	if !useLimit && perr == nil && peak != 0 && peak+gain > opt.TruePeakDB {
-		// 没有限制器时，峰值上限只能靠削减增益来保；
-		// 有限制器时应加满增益再由 alimiter 压峰，否则"整段偏响的素材
-		// 峰值贴顶"会把增益卡成 0，响度永远到不了目标（实测 -21.8 vs 目标 -14）。
-		gain = opt.TruePeakDB - peak
-	}
-	if gain > 24 {
-		gain = 24
-	}
-	if gain < -24 {
-		gain = -24
-	}
-	if math.Abs(gain) < 0.2 {
-		return nil
-	}
-	tmp := path + ".norm.wav"
-	chain := fmt.Sprintf("volume=%.3fdB", gain)
-	if hasAlimiter() {
-		chain += fmt.Sprintf(",alimiter=limit=%.4f:level=disabled", math.Pow(10, opt.TruePeakDB/20))
-	}
-	if _, err := ffx.Run(20*time.Minute, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-		"-i", path, "-af", chain,
-		"-ar", strconv.Itoa(opt.SampleRate), "-ac", strconv.Itoa(opt.Channels), tmp); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	// 归一化后必须比原来更接近目标，且不能变成静音——否则回滚
-	before := lufs
-	after, mErr := MeasureLoudness(tmp)
-	afterPeak, afterPeakErr := PeakDBFS(tmp)
-	if mErr == nil && (after < -60 || (afterPeakErr == nil && afterPeak < -60)) {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("归一化后音频接近静音（%.1f LUFS / 峰值 %.1f dBFS），已回滚保持原音频",
-			after, afterPeak)
-	}
-	if mErr == nil && math.Abs(after-opt.TargetLoudness) > math.Abs(before-opt.TargetLoudness) {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("归一化未改善响度（%.1f → %.1f LUFS），已回滚保持原音频", before, after)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
-}
-
 // normalizeTwoPass 两遍 loudnorm（EBU R128 广播级做法）：
 // 第一遍只测量（input_i/tp/lra/thresh + target_offset），第二遍带 measured_* +
 // linear=true 做**纯线性增益**。单遍 loudnorm（此前实现）是动态模式：它在整条
 // 音轨上实时调增益，音乐尾音会被"泵"一下、对白起伏被压平——linear=true 在
 // 没有 measured_* 参数时是无效参数，等于白写。两遍模式消除泵感，且实测输出
-// 必须更接近目标、不能变成静音（与 normalizeWithGain 同一条护栏）。
+// 必须更接近目标、不能变成静音（护栏：归一化只许改善，不许把声音弄没）。
 func normalizeTwoPass(path string, opt Options) error {
 	measureOut, err := ffx.Run(10*time.Minute, "ffmpeg", "-hide_banner", "-nostats", "-i", path,
 		"-af", fmt.Sprintf("loudnorm=I=%.1f:TP=%.1f:LRA=11:print_format=json", opt.TargetLoudness, opt.TruePeakDB),
@@ -771,25 +702,13 @@ func NormalizeLoudness(in, out string, targetLUFS, truePeakDB float64, opt Optio
 	if truePeakDB == 0 {
 		truePeakDB = opt.TruePeakDB
 	}
-	if ffx.HasLoudnorm() {
-		_, err := ffx.Run(20*time.Minute, "ffmpeg", "-hide_banner", "-y", "-i", in,
-			"-af", fmt.Sprintf("loudnorm=I=%.1f:TP=%.1f:LRA=11:print_format=json", targetLUFS, truePeakDB),
-			"-ar", strconv.Itoa(opt.SampleRate), "-ac", strconv.Itoa(opt.Channels), out)
-		if err != nil {
-			return 0, err
-		}
-		return MeasureLoudness(out)
+	// 严格模式：缺 loudnorm 直接失败，不做降级归一化
+	if !ffx.HasLoudnorm() {
+		return 0, fmt.Errorf("当前 ffmpeg 缺少 loudnorm 滤镜，无法做响度归一化：请升级 ffmpeg（4.1+）")
 	}
-	if in != out {
-		if _, err := ffx.Run(20*time.Minute, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-			"-i", in, "-ar", strconv.Itoa(opt.SampleRate), "-ac", strconv.Itoa(opt.Channels), out); err != nil {
-			return 0, err
-		}
-	}
-	o2 := opt
-	o2.TargetLoudness = targetLUFS
-	o2.TruePeakDB = truePeakDB
-	if err := normalizeWithGain(out, o2); err != nil {
+	if _, err := ffx.Run(20*time.Minute, "ffmpeg", "-hide_banner", "-y", "-i", in,
+		"-af", fmt.Sprintf("loudnorm=I=%.1f:TP=%.1f:LRA=11:print_format=json", targetLUFS, truePeakDB),
+		"-ar", strconv.Itoa(opt.SampleRate), "-ac", strconv.Itoa(opt.Channels), out); err != nil {
 		return 0, err
 	}
 	return MeasureLoudness(out)
@@ -928,8 +847,6 @@ func EnsureWAVDir(dir string) error { return os.MkdirAll(dir, 0o755) }
 var (
 	adelayOnce sync.Once
 	adelayAll  bool
-	limitOnce  sync.Once
-	hasLimit   bool
 	aloopOnce  sync.Once
 	aloopOK    bool
 )
@@ -974,15 +891,6 @@ func withDelay(chain string, ms int) string {
 		return d
 	}
 	return chain + "," + d
-}
-
-// hasAlimiter 探测 alimiter 滤镜（降级归一化用）。
-func hasAlimiter() bool {
-	limitOnce.Do(func() {
-		out, err := ffx.Run(30*time.Second, "ffmpeg", "-hide_banner", "-filters")
-		hasLimit = err == nil && strings.Contains(out, " alimiter ")
-	})
-	return hasLimit
 }
 
 // eofMargin 混音输入的统一超出余量（秒）。

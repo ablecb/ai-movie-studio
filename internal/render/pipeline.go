@@ -187,7 +187,11 @@ func Run(client *ai.Client, cfg *config.Config, opt Options) (*Manifest, error) 
 	for _, t := range plan.Tasks {
 		totalSec += t.DurationSec
 	}
-	est := client.EstimateVideoCost(len(plan.Tasks), totalSec, 0, 0)
+	anchorShots := 0
+	if cfg.Video.EndFrameAnchor && !opt.ImagesOnly {
+		anchorShots = len(plan.Tasks) // 每镜尾帧锚点一张（vidu 路径跳过，此处取上限）
+	}
+	est := client.EstimateVideoCost(len(plan.Tasks), totalSec, 0, 0, anchorShots)
 	fmt.Printf("▶ 渲染计划：%d 个镜头 / 计划时长 %.1fs / 画质 %s / 并发 %d\n",
 		len(plan.Tasks), totalSec, opt.Quality, opt.Workers)
 	fmt.Printf("  %s\n", est.String())
@@ -198,6 +202,18 @@ func Run(client *ai.Client, cfg *config.Config, opt Options) (*Manifest, error) 
 		// 0 = 无上限是出厂默认，但生产里最贵的事故就是"跑着跑着烧穿余额"
 		fmt.Println("  ⚠ 预算上限未设置（budget.max_cost_cny=0）：本次渲染花费上不封顶，强烈建议设置上限")
 	}
+	// 按能力派生图像/视频客户端：providers.image / providers.video 可指向
+	// 与文本不同的供应商（默认：Seedream 出图 + Seedance 出视频，方舟端点）。
+	// 放在 dry-run 之前：缺密钥属于"开工前必须暴露"的自检项，且此处零付费调用。
+	imgc, err := shotkit.CapClient(client, cfg, ai.CapImage, cfg.Providers.Image, cfg.Image.Model)
+	if err != nil {
+		return nil, err
+	}
+	vidc, err := shotkit.CapClient(client, cfg, ai.CapVideo, cfg.Providers.Video, cfg.VideoModel(cfg.Video.DefaultQuality))
+	if err != nil {
+		return nil, err
+	}
+
 	if opt.DryRun {
 		fmt.Println("  （--dry-run：已完成预估与自检，未产生任何付费调用）")
 		// 打印首个镜头的完整提示词：花的钱买到的就是这段文字，
@@ -208,20 +224,25 @@ func Run(client *ai.Client, cfg *config.Config, opt Options) (*Manifest, error) 
 
 	// 5. 角色参考帧：跨镜头一致性的地基，必须在生成任何镜头之前完成
 	// 参考帧质检客户端与 deliver 的视觉复核同源（providers.vision + models.vision），
-	// 共享同一份花费账本；探活失败则跳过质检（EnsureRefFrames 内 fail-open 且显式记录）
+	// 共享同一份花费账本。
+	// 严格模式：质检已启用（默认 strict）但视觉端点不可用 → 拒绝开工。
+	// 静默跳过等于"以为查过、其实没查"——参考帧的错误会经图生图放大到每个出镜镜头。
 	var refVision *ai.Client
 	if cfg.RefQCEnabled() && !client.Mock() {
-		ep := cfg.Providers.Vision
-		refVision = client.For(ai.CapVision, ai.Endpoint{
-			BaseURL: ep.BaseURL, APIKeyEnv: ep.APIKeyEnv, APIKey: cfg.APIKeyFor(ep), Model: cfg.Models.Vision,
-		})
+		rv, rerr := shotkit.CapClient(client, cfg, ai.CapVision, cfg.Providers.Vision, cfg.Models.Vision)
+		if rerr != nil {
+			return nil, rerr
+		}
+		refVision = rv
 		if err := refVision.Ping(); err != nil {
-			fmt.Printf("  ⚠ 参考帧质检不可用（视觉端点探活失败），已跳过——参考帧将不经核对直接使用: %v\n", err)
-			refVision = nil
+			return nil, fmt.Errorf("参考帧质检已启用（ref_qc.mode=%s）但视觉端点探活失败：%w\n"+
+				"  处理：修复 providers.vision 端点/密钥，或将 ref_qc.mode 设为 off 显式关闭质检后重跑", cfg.RefQC.Mode, err)
 		}
 	}
 	fmt.Println("  …准备角色参考帧（跨镜头一致性的基准）")
-	refs, err := shotkit.EnsureRefFrames(client, cfg, opt.RunDir, kit, opt.ForceRef, refVision)
+	// 渲染期只保证主锚点帧就绪（plan=nil）：变体帧由素材阶段按规划生成，
+	// 渲染补帧若带变体会引入"渲染中途换装/换角度"的非预期费用。
+	refs, err := shotkit.EnsureRefFrames(client, cfg, opt.RunDir, kit, nil, opt.ForceRef, refVision)
 	if err != nil {
 		return nil, fmt.Errorf("角色参考帧生成失败: %w", err)
 	}
@@ -234,16 +255,31 @@ func Run(client *ai.Client, cfg *config.Config, opt Options) (*Manifest, error) 
 	// 结束"只有第一个角色有图像级约束"的历史。
 	for i := range plan.Tasks {
 		var refs []string
+		var names []string
 		for _, name := range plan.Tasks[i].Characters {
 			if c, ok := kit.CharOf(name); ok && c.RefImage != "" {
 				refs = append(refs, c.RefImage)
+				names = append(names, name)
 			}
 		}
 		if len(refs) > 0 {
 			plan.Tasks[i].RefImages = refs
+			plan.Tasks[i].RefNames = names
 			plan.Tasks[i].RefImage = refs[0]
 			plan.Tasks[i].UsedRef = true
 		}
+	}
+	// 场景基准图回填：同场次所有镜头共享同一张 establishing 基准（assets/scenes），
+	// 出图时与角色参考帧一起喂给多参考图模型——环境一致性由此从"提示词的一句话"
+	// 变成"一张可逐像素比对的基准图"。
+	anchored, ferr := fillSceneRefs(opt.RunDir, plan.Tasks)
+	if ferr != nil {
+		return nil, ferr
+	}
+	if anchored > 0 {
+		fmt.Printf("  🖼 场景基准图已接入 %d/%d 个镜头（环境一致性锚定）\n", anchored, len(plan.Tasks))
+	} else {
+		fmt.Println("  · 场景基准图未接入（素材库未生成场景图）：环境一致性退化为提示词描述，可在「素材库」生成后重渲")
 	}
 
 	outDir := filepath.Join(opt.RunDir, "output", "shots")
@@ -251,9 +287,9 @@ func Run(client *ai.Client, cfg *config.Config, opt Options) (*Manifest, error) 
 		return nil, err
 	}
 	// 两个清单是 deliver/vision/定点重渲的唯一依据：写失败必须显式暴露，
-	// 静默失败会产生"渲染成功但下游什么都看不到"的断头 run
+	// 静默失败会产生"渲染成功但下游什么都看不到"的断头 run（严格模式：直接失败）
 	if err := fsx.AtomicWriteJSON(filepath.Join(opt.RunDir, "output", "shotplan.json"), plan); err != nil {
-		fmt.Printf("  ⚠ shotplan.json 写入失败: %v（视觉复核与多参考图路径将不可用）\n", err)
+		return nil, fmt.Errorf("shotplan.json 写入失败（视觉复核/定点重渲的唯一依据）：%w", err)
 	}
 
 	manifest := &Manifest{
@@ -266,29 +302,37 @@ func Run(client *ai.Client, cfg *config.Config, opt Options) (*Manifest, error) 
 	gate := quality.NewGate(cfg.Quality)
 
 	// 多参考图生成端点（可选）：两人同框等镜头用它直接产出"合影式"首帧。
-	// 未配置或该端点无密钥时为 nil，渲染自动走单参考帧/纯文生图路径。
-	// 配置了但不可用要明说：否则用户以为双角色已有图像级约束，其实没有。
+	// 未配置（留空）时显式走单参考帧/纯文生图路径；配置了就必须可用——
+	// 严格模式：配置错误（端点不受支持/缺密钥）直接拒绝开工，不允许"配了等于没配"。
 	var editClient *ai.Client
-	if ep := cfg.Providers.ImageEdit; ep.BaseURL != "" && ep.Model != "" {
+	if ep := cfg.Providers.ImageEdit; ep.BaseURL != "" && ep.Model != "" && !client.Mock() {
 		if !ai.ImageEditSupported(ep.BaseURL) {
-			fmt.Printf("  ⚠ providers.image_edit 端点 %s 不受支持（目前仅火山方舟/阿里百炼），多参考图路径未启用\n", ep.BaseURL)
-		} else if cfg.APIKeyFor(ep) == "" {
-			fmt.Printf("  ⚠ providers.image_edit 已配置但缺少密钥（环境变量 %s），多参考图路径未启用："+
-				"双角色镜头只有第一人有图像级约束\n", ep.APIKeyEnv)
-		} else {
-			ec := client.For(ai.CapImageEdit, ai.Endpoint{
-				BaseURL: ep.BaseURL, APIKeyEnv: ep.APIKeyEnv,
-				APIKey: cfg.APIKeyFor(ep), Model: ep.Model,
-			})
-			if !ec.Mock() {
-				editClient = ec
-				fmt.Printf("  🧩 多参考图出图已启用: %s（模型 %s）\n", ec.EndpointInfo(), ep.Model)
-			}
+			return nil, fmt.Errorf("providers.image_edit 端点 %s 不受支持（目前仅火山方舟/阿里百炼）："+
+				"请修正 base_url，或清空该配置以显式走单参考帧路径", ep.BaseURL)
 		}
+		if cfg.APIKeyFor(ep) == "" {
+			return nil, fmt.Errorf("providers.image_edit 已配置但缺少密钥（环境变量 %s）："+
+				"多参考图是双角色镜头的图像级一致性保障，拒绝静默跳过", ep.APIKeyEnv)
+		}
+		ec := client.For(ai.CapImageEdit, ai.Endpoint{
+			BaseURL: ep.BaseURL, APIKeyEnv: ep.APIKeyEnv,
+			APIKey: cfg.APIKeyFor(ep), Model: ep.Model,
+		})
+		if ec.Mock() {
+			return nil, fmt.Errorf("providers.image_edit 端点 %s 不可用（该能力无密钥，退回离线模式）", ep.BaseURL)
+		}
+		editClient = ec
+		fmt.Printf("  🧩 多参考图出图已启用: %s（模型 %s）\n", ec.EndpointInfo(), ep.Model)
+	}
+	// 环境锚在单参考帧路径下带不动：一次只能喂一张图，有角色的镜头会用它锁身份，
+	// 场景基准图"配了却用不上"必须说出来——静默丢失正是这类保障最常见的死法。
+	// 离线演示模式不出图，不适用（警告会误导为"配置问题"）。
+	if anchored > 0 && editClient == nil && !client.Mock() {
+		fmt.Println("  ⚠ providers.image_edit 未配置：角色+场景的多图约束不可用，场景基准图仅在无人物出镜的镜头生效（单参考帧一次只能带一张图）")
 	}
 
 	// 6. 逐镜头生成 + 客观质检 + 换种重渲
-	manifest.Shots = generateAll(client.Context(), client, cfg, gate, opt, plan, outDir, editClient)
+	manifest.Shots = generateAll(client.Context(), imgc, vidc, cfg, gate, opt, plan, outDir, editClient)
 
 	// 定点重渲（--shots）只生成部分镜头：必须把历史 manifest 里未重渲镜头的
 	// 留痕合并回来。否则清单会被本次运行覆盖成只剩几个镜头，deliver 会把
@@ -322,7 +366,7 @@ type chainFrame struct {
 // 才能开工。实现为"轮内小循环"——每遍收集就绪任务、并发派发、等待完成后
 // 重新收集，直到本轮再无可推进的任务。非承接镜头的并发行为不变；
 // 上一镜失败时承接镜头退化为分镜首帧，绝不因衔接依赖留下空洞镜头。
-func generateAll(parent context.Context, client *ai.Client, cfg *config.Config, gate *quality.Gate,
+func generateAll(parent context.Context, imgc, vidc *ai.Client, cfg *config.Config, gate *quality.Gate,
 	opt Options, plan *shotkit.Plan, outDir string, editClient *ai.Client) []ShotRecord {
 
 	records := make([]ShotRecord, len(plan.Tasks))
@@ -385,7 +429,7 @@ func generateAll(parent context.Context, client *ai.Client, cfg *config.Config, 
 				if round > 0 {
 					t.Seed = shotkit.DeriveSeed(t.ShotID, round, seedSalt(t))
 				}
-				rec := renderShot(runCtx, client, cfg, gate, opt, t, outDir, round, editClient, chainFrames[i])
+				rec := renderShot(runCtx, imgc, vidc, cfg, gate, opt, t, outDir, round, editClient, chainFrames[i])
 				mu.Lock()
 				records[i] = mergeRecord(records[i], rec)
 				if rec.Error != "" && fatal == nil && ai.IsFatal(fmt.Errorf("%s", rec.Error)) {
@@ -576,6 +620,12 @@ func mergeRecord(prev, cur ShotRecord) ShotRecord {
 		prev.ActualDur = cur.ActualDur
 		prev.Error = ""
 	}
+	if cur.Status == "imaged" {
+		// --images-only 的产物状态必须落账：否则 manifest 全记 pending，
+		// 镜头被误判缺失、动态分镜拿不到首帧路径，已付费的首帧"看不见"。
+		prev.Status = "imaged"
+		prev.Image = cur.Image
+	}
 	return prev
 }
 
@@ -586,7 +636,7 @@ func mergeRecord(prev, cur ShotRecord) ShotRecord {
 //  2. 多参考图模型：两人同框等镜头把全部角色参考帧一起喂给 image_edit 端点
 //  3. 单参考帧图生图：主角色参考帧 + ref_strength（单角色镜头的基线手段）
 //  4. 纯文生图：无角色出镜的镜头
-func renderShot(ctx context.Context, client *ai.Client, cfg *config.Config, gate *quality.Gate,
+func renderShot(ctx context.Context, imgc, vidc *ai.Client, cfg *config.Config, gate *quality.Gate,
 	opt Options, t shotkit.Task, outDir string, round int, editClient *ai.Client, cf chainFrame) ShotRecord {
 
 	rec := ShotRecord{
@@ -600,6 +650,7 @@ func renderShot(ctx context.Context, client *ai.Client, cfg *config.Config, gate
 	}
 	imgPath := filepath.Join(outDir, t.ShotID+".png")
 	vidPath := filepath.Join(outDir, t.ShotID+".mp4")
+	plannedPath := filepath.Join(outDir, t.ShotID+".planned.png")
 	invalidDir := filepath.Join(outDir, "invalid")
 	_ = os.MkdirAll(invalidDir, 0o755)
 
@@ -611,14 +662,19 @@ func renderShot(ctx context.Context, client *ai.Client, cfg *config.Config, gate
 	//     否则图像级缺陷（构图错/糊）在结构上永远修不掉
 	//  2. 本轮失败时上一轮的合格视频/图片能原样恢复——已付费的好资产不能
 	//     因为一轮失败的重渲被隔离销毁（manifest 记 done、文件却在 invalid/）
-	var prevVid, prevImg string
+	var prevVid, prevImg, prevPlanned string
 	if round > 0 {
 		prevVid = setAside(vidPath)
 		prevImg = setAside(imgPath)
+		// 锚点同样"换种重渲换一次结果"：提示词变体变了，复用旧锚点
+		// 会把新 take 又钉回旧构图
+		if cfg.Video.EndFrameAnchor {
+			prevPlanned = setAside(plannedPath)
+		}
 	}
 
 	// 离线演示：用 ffmpeg 生成真实可探测的占位素材，保证字幕重排/混音/交付校验链路可验证
-	if client.Mock() {
+	if imgc.Mock() {
 		if err := mockAssets(cfg, t, imgPath, vidPath); err != nil {
 			rr.Error = "离线占位素材生成失败: " + err.Error()
 			rr.Severity = quality.SeverityBlock
@@ -674,7 +730,7 @@ func renderShot(ctx context.Context, client *ai.Client, cfg *config.Config, gate
 		// ---- 1) 首帧图（链式承接 > 多参考图 > 单参考帧 > 纯文生图）----
 		var iv quality.ImageVerdict
 		if !fsx.FileExists(imgPath) {
-			model, usedRef, ferr := genFirstFrame(client, editClient, cfg, opt, t, imgPrompt, chainPath, imgPath)
+			model, usedRef, ferr := genFirstFrame(imgc, editClient, cfg, opt, t, imgPrompt, chainPath, imgPath)
 			if ferr != nil {
 				lastErr = fmt.Errorf("首帧出图失败: %w", ferr)
 				rr.Error = lastErr.Error()
@@ -719,69 +775,105 @@ func renderShot(ctx context.Context, client *ai.Client, cfg *config.Config, gate
 			rr.Error = lastErr.Error()
 			continue
 		}
-		// 链式衔接的"尾帧锚点"：首帧承接上镜末帧保证了衔接处的连续，
-		// 但镜头内部的运动没有终点约束，仍会漂离分镜构图。生成一张本镜
-		// 的分镜首帧（参考图锁定角色）作为 CogVideoX 首尾帧数组的尾帧，
-		// 运动被夹在"上镜末态 → 本镜构图"之间。失败/质检不过就退回单首帧。
+		// 尾帧锚点（首尾帧数组的第二张）：把运动的终点钉在分镜构图上。
+		// 配置开启后**每镜都带**（不再只限链式承接镜头）——有承接时首帧=上镜
+		// 末帧、尾帧=本镜构图（首尾夹逼，接缝连续且运动有终点）；无承接时
+		// 首尾两端同为分镜构图（画面锁在两端，中途不漂离）。
+		// 严格模式：开启后锚点就必须就绪——生成/质检失败即本轮失败（重试），
+		// 不允许静默退回单首帧（那等于把"运动终点被钉住"的保障悄悄拿掉）。
 		endImage := ""
-		if chainPath != "" {
-			plannedPath := filepath.Join(outDir, t.ShotID+".planned.png")
-			if planned, _, _, perr := genPlannedFrame(client, editClient, cfg, opt, t, imgPrompt, plannedPath); perr == nil {
-				if pv := gate.CheckImageScene(planned.path, t.MustHaveFace, quality.SceneCtx{Night: t.Night}); pv.OK || pv.Severity != quality.SeverityBlock {
-					if data, derr := shotkit.ReadAsDataURL(planned.path); derr == nil {
-						endImage = data
-						rec.PlannedFrame = planned.rel
-						fmt.Printf("  🖼 %s 尾帧锚点就绪（分镜构图，衔接更可控）\n", t.ShotID)
-					}
-				} else {
-					fmt.Printf("  ⚠ %s 尾帧锚点质检未通过（%s），退回单首帧衔接\n",
-						t.ShotID, strings.Join(pv.Codes(), ","))
+		// 多模态参考生视频（video.reference_model，Seedance 2.x 全模态参考）：
+		// 一次上传该镜头相关的全部参考图，并在提示词里逐张声明用途（@imageN）——
+		// 出镜角色标准像（身份锚）→ 场次 establishing 基准（环境锚）→ 本镜首帧（构图锚）。
+		// 参考任务与首尾帧任务在官方语义下二选一，走参考模式即放弃尾帧锚点，
+		// 构图控制改由"首帧参考图声明"承担。
+		// 首帧已在盘上（--images-only / 断点续跑）时链式承接本就不会被消费
+		// （复用优先），不再因 chainPath 把镜头挡回首尾帧路径。
+		firstFrameOnDisk := fsx.FileExists(imgPath)
+		viaRefModel := cfg.Video.ReferenceModel != "" &&
+			(len(t.RefImages) > 0 || t.SceneRefImage != "") &&
+			(chainPath == "" || firstFrameOnDisk)
+		if cfg.Video.EndFrameAnchor && !viaRefModel {
+			// 已存在则复用（断点续跑/失败重试省钱）；重渲轮会被 setAside 移走强制重出
+			if !fsx.FileExists(plannedPath) {
+				if _, _, _, perr := genPlannedFrame(imgc, editClient, cfg, opt, t, imgPrompt, plannedPath); perr != nil {
+					lastErr = fmt.Errorf("尾帧锚点生成失败（end_frame_anchor 已开启，拒绝退回单首帧）: %w", perr)
+					rr.Error = lastErr.Error()
+					continue
 				}
-			} else {
-				fmt.Printf("  ⚠ %s 尾帧锚点生成失败（%v），退回单首帧衔接\n", t.ShotID, perr)
 			}
+			pv := gate.CheckImageScene(plannedPath, t.MustHaveFace, quality.SceneCtx{Night: t.Night})
+			if !pv.OK && pv.Severity == quality.SeverityBlock {
+				// 坏锚点不留在盘上反复复用：隔离留证，本轮失败重出
+				quarantine(plannedPath, invalidDir, t.ShotID, round, "anchor")
+				lastErr = fmt.Errorf("尾帧锚点质检未通过（%s）（end_frame_anchor 已开启，拒绝退回单首帧）", strings.Join(pv.Codes(), ","))
+				rr.Error = lastErr.Error()
+				continue
+			}
+			data, derr := shotkit.ReadAsDataURL(plannedPath)
+			if derr != nil {
+				lastErr = fmt.Errorf("读取尾帧锚点失败: %w", derr)
+				rr.Error = lastErr.Error()
+				continue
+			}
+			endImage = data
+			rec.PlannedFrame = filepath.ToSlash(filepath.Join("output", "shots", t.ShotID+".planned.png"))
+			fmt.Printf("  🖼 %s 尾帧锚点就绪（分镜构图，首尾帧锁定）\n", t.ShotID)
+		} else if viaRefModel {
+			// 参考生视频任务与首/尾帧在官方任务类型上互斥：不为一张用不上的图付费
+			fmt.Printf("  ↷ %s 走多模态参考生视频（%s），该任务类型无首尾帧概念，跳过锚点\n", t.ShotID, cfg.Video.ReferenceModel)
 		}
-		// 多角色同框（且非链式承接）优先走参考图生视频模型（vidu2-reference）：
-		// 1-3 张参考图直接约束视频里的主体，一致性显著优于"单首帧 + 文字提示"。
-		// 失败自动降级 cogvideox-3 图生视频，绝不因增强路径失败而卡死镜头。
+		// 多模态参考生视频（Seedance 2.x 全模态参考）：一次上传该镜头相关的全部
+		// 参考照片，提示词里逐张声明用途（官方 @imageN 语法）。身份/环境/构图三类
+		// 约束同时以图像级强度生效，一致性显著优于"单首帧 + 文字提示"。
+		// 严格模式：这条路走了就必须走通——失败即本轮失败，不回落普通图生视频
+		//（回落意味着同框第二人/环境锚/构图锚又失去图像级约束，是静默的产物劣化）。
 		videoURL := ""
-		if cfg.Video.ReferenceModel != "" && len(t.RefImages) >= 2 && chainPath == "" {
-			refs := make([]string, 0, len(t.RefImages))
-			for _, rp := range t.RefImages {
-				if r, rerr := shotkit.ReadAsDataURL(filepath.Join(opt.RunDir, filepath.FromSlash(rp))); rerr == nil {
-					refs = append(refs, r)
-				}
+		if viaRefModel {
+			refs, decls, rerr := buildOmniRefs(opt.RunDir, t, imgPath)
+			if rerr != nil {
+				lastErr = fmt.Errorf("多模态参考组装失败: %w", rerr)
+				rr.Error = lastErr.Error()
+				continue
 			}
-			if len(refs) >= 2 {
-				vURL, verr := client.VideoGen(videoPrompt, "", ai.VideoOptions{
-					Model: cfg.Video.ReferenceModel, Timeout: opt.Timeout,
-					Watermark: cfg.Video.Watermark, RefImages: refs,
-					AspectRatio: aspectOf(cfg.Video.Size),
-					// 运动幅度服从分镜的运镜意图，不再交给模型自定（"固定"被推成横摇
-					// 这类事只有显式参数能拦住）
-					MovementAmplitude: promspec.MovementAmplitude(t.CameraMove),
-				})
-				if verr != nil {
-					fmt.Printf("  ⚠ %s 参考图生视频失败，降级图生视频: %v\n", t.ShotID, verr)
-				} else {
-					videoURL = vURL
-					rec.Model = cfg.Video.ReferenceModel
-					fmt.Printf("  🎞 %s 参考图生视频（%s ×%d 参考图）\n", t.ShotID, cfg.Video.ReferenceModel, len(refs))
+			vURL, verr := vidc.VideoGen("render.shot_video", videoPrompt+"\n\n"+decls, "", ai.VideoOptions{
+				Model: cfg.Video.ReferenceModel, Timeout: opt.Timeout,
+				Watermark: cfg.Video.Watermark, RefImages: refs,
+				Size: cfg.Video.Size, AspectRatio: aspectOf(cfg.Video.Size),
+				// 时长档位与首尾帧路径同一套换算（5/10s；2.x 支持到 30s），
+				// 不传的话模型自选时长，交付重排会对不上分镜节奏
+				Duration: videoDurationFor(t.DurationSec, cfg),
+				// 运镜意图服从分镜，不交给模型自定（"固定"被推成横摇这类事
+				// 只有显式参数能拦住）：vidu 系用运动幅度，Seedance 用 camera_fixed
+				MovementAmplitude: promspec.MovementAmplitude(t.CameraMove),
+				CameraFixed:       t.CameraMove == "固定",
+			})
+			if verr != nil {
+				lastErr = fmt.Errorf("多模态参考生视频失败（%s）: %w", cfg.Video.ReferenceModel, verr)
+				rr.Error = lastErr.Error()
+				if ai.IsFatal(verr) {
+					break
 				}
+				continue
 			}
-		}
-		if videoURL == "" {
-			vURL, verr := client.VideoGen(videoPrompt, ref, ai.VideoOptions{
+			videoURL = vURL
+			rec.Model = cfg.Video.ReferenceModel
+			rec.UsedRef = true
+			fmt.Printf("  🎞 %s 多模态参考生视频（%s ×%d 参考图，逐张声明）\n", t.ShotID, cfg.Video.ReferenceModel, len(refs))
+		} else {
+			vURL, verr := vidc.VideoGen("render.shot_video_ref", videoPrompt, ref, ai.VideoOptions{
 				Model: cfg.VideoModel(opt.Quality), Quality: qualityMode(opt.Quality),
 				Size: cfg.Video.Size, FPS: cfg.Video.FPS, Timeout: opt.Timeout,
-				WithAudio: cfg.Video.WithAudio, Fallbacks: cfg.Video.FallbackModels,
+				WithAudio: cfg.Video.WithAudio,
 				Watermark: cfg.Video.Watermark,
 				// 计划时长 >5.5s 的镜头请求 10s 档：官方支持 5/10 两档，
 				// 不用的话所有镜头都会被服务端压成 ~5s，只能靠后期拉伸凑时长
 				Duration: videoDurationFor(t.DurationSec, cfg),
-				// 首尾帧数组（仅链式衔接非空）：首帧=上镜末帧，尾帧=本镜分镜构图。
-				// 模型不支持时 ai 层自动降级单首帧重试。
+				// 首尾帧数组：首帧=上镜末帧（有承接时）或分镜构图，尾帧=本镜分镜构图
+				// （video.end_frame_anchor）。严格模式：模型不支持即失败（不降级）。
 				EndImage: endImage,
+				// Seedance 的机位固定开关（智谱/vidu 忽略该字段）
+				CameraFixed: t.CameraMove == "固定",
 			})
 			if verr != nil {
 				lastErr = fmt.Errorf("图生视频失败: %w", verr)
@@ -822,14 +914,16 @@ func renderShot(ctx context.Context, client *ai.Client, cfg *config.Config, gate
 			rr.Error = lastErr.Error()
 			continue
 		}
-		client.RecordVideoCost(vv.DurationSec)
+		vidc.RecordVideoCost(vv.DurationSec)
 		// 本轮成功：上一轮暂存产物降级为证据留档（新 take 已就位，旧 take 可对比复盘）
 		retireAside(prevVid, invalidDir, t.ShotID, round, "vid")
 		retireAside(prevImg, invalidDir, t.ShotID, round, "img")
+		retireAside(prevPlanned, invalidDir, t.ShotID, round, "planned")
 
 		rec.Status = "done"
 		rec.Image = filepath.ToSlash(filepath.Join("output", "shots", t.ShotID+".png"))
 		rec.Video = filepath.ToSlash(filepath.Join("output", "shots", t.ShotID+".mp4"))
+		ai.AttachCallArtifact(url, rec.Video) // 调用记录回填本地路径（平台 URL 会过期）；必须在 rec.Video 就位后调用，空路径会被静默忽略
 		rec.ActualDur = vv.DurationSec
 		rec.Attempts = attempts
 		rec.VideoMetrics = &vv
@@ -868,6 +962,9 @@ func renderShot(ctx context.Context, client *ai.Client, cfg *config.Config, gate
 	if round > 0 {
 		restoreAside(vidPath, prevVid, invalidDir, t.ShotID, round, "vid")
 		restoreAside(imgPath, prevImg, invalidDir, t.ShotID, round, "img")
+		if cfg.Video.EndFrameAnchor {
+			restoreAside(plannedPath, prevPlanned, invalidDir, t.ShotID, round, "planned")
+		}
 	}
 	return rec
 }
@@ -948,6 +1045,131 @@ type plannedFrame struct {
 	rel  string
 }
 
+// sceneRefNote 场景基准图随请求附上时的声明：明确它的位置与用途——
+// 不声明的话模型只会把最后一张图当"又一张泛泛的参考"，环境锚定落不到实处。
+// 只在场景基准真的随请求发出时才能追加（图序最后一张）。
+const sceneRefNote = "\nEnvironment reference: the final reference image is this scene's establishing " +
+	"baseline — keep the location, set dressing, lighting direction and atmosphere consistent with it."
+
+// plannedRefImages 组装出图参考图序：角色在前（身份锚），场景基准在后（环境锚）。
+//
+// 顺序即语义：多参考图请求里模型按序理解每张图，prompt 也按这个顺序声明，
+// 二者错位会让"环境锚点"被当成"又一个角色"。
+// 不在这里预截断：4 张上限由多参考图层统一执行（media_edit，截断后登记存档
+// 的才是真实随请求发出的那几张）。
+func plannedRefImages(t shotkit.Task) []string {
+	refs := make([]string, 0, len(t.RefImages)+1)
+	refs = append(refs, t.RefImages...)
+	if t.SceneRefImage != "" {
+		refs = append(refs, t.SceneRefImage)
+	}
+	return refs
+}
+
+// buildOmniRefs 组装多模态参考生视频的参考图序与逐张用途声明（官方 @imageN 语法）。
+//
+// 顺序即语义，声明编号必须与请求 content 里参考图的实际顺序一一对应：
+//   - 出镜角色标准像（身份锚）：RefNames 与 RefImages 同源同序，缺参考帧的角色
+//     两侧同时缺席，不会张冠李戴
+//   - 场次 establishing 基准（环境锚）
+//   - 本镜首帧（构图锚，已定稿时）：替代参考任务里不存在的首帧 role
+//
+// 返回（参考图 data URL 列表, 追加到提示词尾部的声明块, 错误）。
+func buildOmniRefs(runDir string, t shotkit.Task, firstFramePath string) ([]string, string, error) {
+	refs := make([]string, 0, len(t.RefImages)+2)
+	var b strings.Builder
+	b.WriteString("Reference images, each declared by position (all attached as reference_image):\n")
+	add := func(path, decl string) error {
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(runDir, filepath.FromSlash(path))
+		}
+		data, err := shotkit.ReadAsDataURL(path)
+		if err != nil {
+			return err
+		}
+		refs = append(refs, data)
+		fmt.Fprintf(&b, "- @image%d %s\n", len(refs), decl)
+		return nil
+	}
+	for i, name := range t.RefNames {
+		if i >= len(t.RefImages) {
+			break
+		}
+		decl := fmt.Sprintf("is the standard portrait of %s — every appearance of %s in the video must match this face, "+
+			"hairstyle and wardrobe exactly; identity stays locked.", name, name)
+		if err := add(t.RefImages[i], decl); err != nil {
+			return nil, "", fmt.Errorf("角色参考帧（%s）读取失败: %w", name, err)
+		}
+	}
+	if t.SceneRefImage != "" {
+		if err := add(t.SceneRefImage,
+			"is the establishing baseline of this scene's location — keep the environment, set dressing, "+
+				"lighting direction and atmosphere consistent with it."); err != nil {
+			return nil, "", fmt.Errorf("场景基准图读取失败: %w", err)
+		}
+	}
+	if firstFramePath != "" && fsx.FileExists(firstFramePath) {
+		if err := add(firstFramePath,
+			"is the approved opening frame of this shot — begin the video from this exact framing "+
+				"and keep the composition anchored to it."); err != nil {
+			return nil, "", fmt.Errorf("首帧（构图锚）读取失败: %w", err)
+		}
+	}
+	if len(refs) == 0 {
+		return nil, "", fmt.Errorf("多模态参考生视频需要至少一张参考图（角色/场景/首帧均未就绪）")
+	}
+	return refs, b.String(), nil
+}
+
+// fillSceneRefs 把场次 establishing 基准图回填到生成计划的每个镜头（环境一致性锚点）。
+//
+// 选图规则：shotspec 声明了 scene_state 的镜头取该状态变体（如"雷云散尽"的美术
+// 基准），其余取场次主基准。这条绑定不能反着做（一律用主基准）：高潮段环境已经
+// 剧变，却拿初始状态的基准图当"必须保持一致"的参照，锚点会跟画面描述打架。
+//
+// 语义边界（"未提供"与"丢失"必须分开）：
+//   - 素材库没有场景条目（老 run / 跳过素材阶段）= 未提供：不算失败，环境一致性
+//     退化为提示词描述，由调用方打印说明。
+//   - 声明了状态但索引里没有该变体 / 索引声明了文件但文件不在盘上 = 素材缺失：
+//     显式失败——静默回退会让"这一镜的环境锚"变成另一张图或整个消失，
+//     而"以为锚了、其实没锚"比重渲前发现贵得多。
+//
+// 返回成功锚定的镜头数。
+func fillSceneRefs(runDir string, tasks []shotkit.Task) (int, error) {
+	ix := shotkit.LoadAssetIndex(runDir)
+	if len(ix.Scenes) == 0 {
+		return 0, nil
+	}
+	n := 0
+	for i := range tasks {
+		state := strings.TrimSpace(tasks[i].SceneRefState)
+		rel := ""
+		if state != "" {
+			rel = ix.VariantOf(tasks[i].SceneID, state)
+			if rel == "" {
+				return n, fmt.Errorf("镜头 %s 声明了环境状态 %q，但素材索引中场次 %s 没有该变体的场景图\n"+
+					"  处理：重新生成素材（studio assets --run %s）补齐该状态，或修正 shotspec 中的 scene_state；"+
+					"静默回退主基准会让这一镜的环境锚指向另一个状态",
+					tasks[i].ShotID, state, tasks[i].SceneID, filepath.ToSlash(runDir))
+			}
+		} else {
+			rel = ix.BaselineOf(tasks[i].SceneID)
+			if rel == "" {
+				continue
+			}
+		}
+		if !fsx.FileExists(filepath.Join(runDir, filepath.FromSlash(rel))) {
+			return n, fmt.Errorf("场次 %s 的场景基准图缺失（素材索引声明的文件不在盘上）: %s\n"+
+				"  处理：重新生成素材（studio assets --run %s），或删除 output/assets/index.json 中该条目后再渲染；"+
+				"静默跳过会让整片的环境一致性锚定悄悄消失",
+				tasks[i].SceneID, rel, filepath.ToSlash(runDir))
+		}
+		tasks[i].SceneRefImage = rel
+		n++
+	}
+	return n, nil
+}
+
 // genPlannedFrame 按"分镜构图"生成一张首帧（多参考图 > 单参考帧 > 纯文生图）。
 // 两个用途：
 //   - 非链式镜头的首帧（genFirstFrame 的 2-4 级路径）
@@ -959,28 +1181,43 @@ func genPlannedFrame(client, editClient *ai.Client, cfg *config.Config, opt Opti
 
 	tw, th := firstFrameSize(cfg)
 	rel := filepath.ToSlash(filepath.Join("output", "shots", filepath.Base(outPath)))
+	refPaths := plannedRefImages(t)
 
-	// 2) 多参考图模型（两人同框等）
-	if editClient != nil && len(t.RefImages) >= 2 {
-		refs := make([]string, 0, len(t.RefImages))
-		for _, rp := range t.RefImages {
-			if ref, err := shotkit.ReadAsDataURL(filepath.Join(opt.RunDir, filepath.FromSlash(rp))); err == nil {
-				refs = append(refs, ref)
+	// 2) 多参考图模型：多角色同框，或"角色 + 场景基准"。
+	// 严格模式：配置了 image_edit 且本镜需要多图约束，就必须走通——
+	// 失败即本轮失败，不回落单参考帧（回落意味着同框第二人/环境锚失去图像级约束）。
+	if editClient != nil && len(refPaths) >= 2 {
+		// 场景基准排在参考图序最后，超上限（ai.MaxEditRefs）截断时会被裁掉：
+		// 声明必须与实际发出的图一致，没发出去的图不能让提示词声称"以它为准"。
+		if t.SceneRefImage != "" {
+			if len(refPaths) <= ai.MaxEditRefs {
+				imgPrompt += sceneRefNote
+			} else {
+				fmt.Printf("  ⚠ %s 参考图 %d 张超出单次上限 %d：场景基准图本次未随请求附上（角色身份锚优先）\n",
+					t.ShotID, len(refPaths), ai.MaxEditRefs)
 			}
 		}
-		if len(refs) >= 2 {
-			url, model, err := editClient.ImageEditMulti(imgPrompt, refs, ai.ImageOptions{
-				Model: cfg.Providers.ImageEdit.Model, Size: cfg.Image.Size,
-			})
-			if err == nil {
-				if dlErr := shotkit.Download(url, outPath); dlErr == nil {
-					normalizeFirstFrame(outPath, tw, th)
-					fmt.Printf("  🖼 %s 首帧（多参考图×%d 模型=%s）\n", t.ShotID, len(refs), model)
-					return plannedFrame{outPath, rel}, "edit:" + model, true, nil
-				}
+		refs := make([]string, 0, len(refPaths))
+		for _, rp := range refPaths {
+			ref, err := shotkit.ReadAsDataURL(filepath.Join(opt.RunDir, filepath.FromSlash(rp)))
+			if err != nil {
+				return plannedFrame{}, "", false, fmt.Errorf("多参考图出图需要全部参考图（角色/场景基准），读取 %s 失败: %w", rp, err)
 			}
-			fmt.Printf("  ⚠ %s 多参考图出图失败，降级单参考帧: %v\n", t.ShotID, err)
+			refs = append(refs, ref)
 		}
+		url, model, err := editClient.ImageEditMulti("render.shot_image_edit", imgPrompt, refs, ai.ImageOptions{
+			Model: cfg.Providers.ImageEdit.Model, Size: cfg.Image.Size,
+		})
+		if err != nil {
+			return plannedFrame{}, "", false, fmt.Errorf("多参考图出图失败（providers.image_edit 已配置，拒绝降级单参考帧）: %w", err)
+		}
+		if err := shotkit.Download(url, outPath); err != nil {
+			return plannedFrame{}, "", false, fmt.Errorf("多参考图出图下载失败: %w", err)
+		}
+		normalizeFirstFrame(outPath, tw, th)
+		ai.AttachCallArtifact(url, rel)
+		fmt.Printf("  🖼 %s 首帧（多参考图×%d 模型=%s）\n", t.ShotID, len(refs), model)
+		return plannedFrame{outPath, rel}, "edit:" + model, true, nil
 	}
 
 	imgOpt := ai.ImageOptions{
@@ -989,15 +1226,32 @@ func genPlannedFrame(client, editClient *ai.Client, cfg *config.Config, opt Opti
 		Quality:   cfg.Image.Quality,
 		Watermark: cfg.Image.Watermark,
 	}
-	// 3) 单参考帧图生图
-	if t.RefImage != "" && cfg.Video.ImageToImage {
-		if ref, err := shotkit.ReadAsDataURL(filepath.Join(opt.RunDir, filepath.FromSlash(t.RefImage))); err == nil {
-			imgOpt.RefImage = ref
-			imgOpt.RefStrength = 0.6
+	// 3) 单参考帧图生图：主角色参考帧优先；无人物出镜的环境镜头用场景基准图——
+	// "同一个地点"要的正是这张图（纯文字描述环境的一致性远低于参考图）。
+	// 严格模式：参考图读不出来即失败——静默丢掉参考图等于把该镜头降级成
+	// 纯文生图（跨镜头换脸/环境漂移的根因）。
+	primaryRef, fromScene := t.RefImage, false
+	if primaryRef == "" && t.SceneRefImage != "" {
+		primaryRef, fromScene = t.SceneRefImage, true
+	}
+	if primaryRef != "" && cfg.Video.ImageToImage {
+		if fromScene {
+			// 这一路图生图用的就是场景基准图：声明与实际一致
+			imgPrompt += sceneRefNote
 		}
+		ref, err := shotkit.ReadAsDataURL(filepath.Join(opt.RunDir, filepath.FromSlash(primaryRef)))
+		if err != nil {
+			kind := "角色参考帧"
+			if fromScene {
+				kind = "场景基准图"
+			}
+			return plannedFrame{}, "", false, fmt.Errorf("读取%s失败（拒绝降级为纯文生图）: %w", kind, err)
+		}
+		imgOpt.RefImage = ref
+		imgOpt.RefStrength = 0.6
 	}
 	// 4) 出图（有参考图 = 图生图；没有 = 纯文生图）
-	url, model, err := client.ImageGenEx(imgPrompt, imgOpt, cfg.Image.FallbackModels)
+	url, model, err := client.ImageGenEx("render.shot_image", imgPrompt, imgOpt)
 	if err != nil {
 		return plannedFrame{}, "", false, err
 	}
@@ -1005,6 +1259,7 @@ func genPlannedFrame(client, editClient *ai.Client, cfg *config.Config, opt Opti
 		return plannedFrame{}, "", false, fmt.Errorf("首帧下载失败: %w", err)
 	}
 	normalizeFirstFrame(outPath, tw, th)
+	ai.AttachCallArtifact(url, rel)
 	return plannedFrame{outPath, rel}, model, imgOpt.RefImage != "", nil
 }
 

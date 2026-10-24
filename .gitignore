@@ -15,3 +15,11 @@ projects/**/film/
 projects/**/_segments/
 projects/**/_intermediate/
 projects/**/*.mp4
+
+# Web 控制台本地数据（任务日志/索引）
+.web/
+# 第三方工具发行包（ffmpeg 等，222M+ 二进制不入库）
+tools/
+
+# 运行时日志与 AI 调用留痕
+logs/

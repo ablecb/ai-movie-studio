@@ -19,17 +19,22 @@ const filmBase = `你是专业级 AI 电影制作流水线中的资深成员。
 
 // callTune 按阶段调用的采样参数（callJSON 按 callName 查表）：
 // 结构化产出低温——输出抖动导致 JSON 解析失败的重试是双倍 token；创作类保留高温。
-// storyboard/prompts/music 的 JSON 随镜头数线性膨胀（cue 与音效清单逐镜展开），
+// storyboard/prompts/music/shotspec 的 JSON 随镜头数线性膨胀（cue 与音效清单逐镜展开），
 // MaxTokens 放宽防截断（截断=必然重试）。
+// 注意：思考型模型（如 glm-5.3-flash）的思考内容计入输出预算，思考未完成即被
+// 截断会导致正文为空——预算必须给"思考 + JSON"双份空间。
+// 本表只覆盖 skills 包的阶段调用；包外调用点（如 shotkit.PlanAssets 的
+// assets.plan）不在表内，必须在调用处用 CallOpts 显式给同样的预算——漏配时走
+// 全局默认，正是被思考耗尽、正文为空的真实事故。
 var callTune = map[string]ai.CallOpts{
-	"script":     {Temperature: 0.8, MaxTokens: 4096},
-	"characters": {Temperature: 0.4, MaxTokens: 4096},
-	"storyboard": {Temperature: 0.4, MaxTokens: 8192},
-	"prompts":    {Temperature: 0.3, MaxTokens: 16384},
-	"voiceover":  {Temperature: 0.4, MaxTokens: 4096},
-	"music":      {Temperature: 0.5, MaxTokens: 16384},
-	"shotspec":   {Temperature: 0.35, MaxTokens: 16384},
-	"review":     {Temperature: 0.2, MaxTokens: 4096},
+	"script":     {Temperature: 0.8, MaxTokens: 16384},
+	"characters": {Temperature: 0.4, MaxTokens: 16384},
+	"storyboard": {Temperature: 0.4, MaxTokens: 32768},
+	"prompts":    {Temperature: 0.3, MaxTokens: 32768},
+	"voiceover":  {Temperature: 0.4, MaxTokens: 16384},
+	"music":      {Temperature: 0.5, MaxTokens: 32768},
+	"shotspec":   {Temperature: 0.35, MaxTokens: 32768},
+	"review":     {Temperature: 0.2, MaxTokens: 16384},
 }
 
 // callJSON 调用 AI 并解析 JSON 输出到 out。

@@ -42,7 +42,10 @@ func cmdPolish(args []string) error {
 		return err
 	}
 	client := newClient(cfg)
-	visionClient := newVisionClient(cfg)
+	visionClient, err := newVisionClient(cfg)
+	if err != nil {
+		return err
+	}
 	if visionClient.Mock() {
 		return fmt.Errorf("polish 需要视觉端点与密钥（providers.vision，环境变量 %s）", cfg.Providers.Vision.APIKeyEnv)
 	}
@@ -62,8 +65,8 @@ func cmdPolish(args []string) error {
 		if err != nil {
 			return fmt.Errorf("视觉复核失败: %w", err)
 		}
-		fmt.Printf("  👁 均分 %.1f（身份 %s / 解剖 %s / 电影感 %s）\n", rep.Score,
-			avgStr(rep.IdentityAvg), avgStr(rep.AnatomyAvg), avgStr(rep.CinematicAvg))
+		fmt.Printf("  👁 均分 %.1f（身份 %s / 解剖 %s / 电影感 %s / 环境 %s）\n", rep.Score,
+			avgStr(rep.IdentityAvg), avgStr(rep.AnatomyAvg), avgStr(rep.CinematicAvg), avgStr(rep.SceneAvg))
 		for _, n := range rep.Notes {
 			fmt.Printf("  ℹ %s\n", n)
 		}

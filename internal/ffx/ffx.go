@@ -14,7 +14,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -201,10 +200,18 @@ func Preflight() error {
 		return fmt.Errorf("缺少可执行文件 %s：请安装 ffmpeg（推荐 full/essentials 构建，含 ffprobe）并加入 PATH，\n"+
 			"  或用环境变量 STUDIO_FFMPEG / STUDIO_FFPROBE 指定路径", strings.Join(c.Missing, ", "))
 	}
-	// 这些滤镜是后期链路的关键依赖，缺失就必须显式告知（而不是静默产出低质成片）
+	// 这些能力/滤镜是后期链路的关键依赖。
+	// 严格模式：缺失即阻塞开工（而不是降级产出：没有 ffprobe 就没有"实测优先"，
+	// 没有 loudnorm 就没有合规的响度归一化）。
+	if c.FFprobePath == "" {
+		return fmt.Errorf("缺少 ffprobe：请安装完整 ffmpeg 包（含 ffprobe），或用 STUDIO_FFPROBE 指定路径")
+	}
 	var lack []string
-	if !c.HasEbur128 && !c.HasLoudnorm {
-		lack = append(lack, "响度测量（ebur128/loudnorm）")
+	if !c.HasEbur128 {
+		lack = append(lack, "响度测量（ebur128）")
+	}
+	if !c.HasLoudnorm {
+		lack = append(lack, "响度归一化（loudnorm）")
 	}
 	if !c.HasSidechain {
 		lack = append(lack, "侧链闪避（sidechaincompress）")
@@ -241,8 +248,8 @@ type Capabilities struct {
 	FFmpegPath   string   `json:"ffmpeg_path"`
 	FFprobePath  string   `json:"ffprobe_path"`
 	Version      string   `json:"version"`
-	HasLoudnorm  bool     `json:"has_loudnorm"`  // 缺失时用 ebur128+增益降级
-	HasEbur128   bool     `json:"has_ebur128"`   // 响度测量（老构建也有）
+	HasLoudnorm  bool     `json:"has_loudnorm"`  // 响度归一化（严格模式必需）
+	HasEbur128   bool     `json:"has_ebur128"`   // 响度测量
 	HasSubtitles bool     `json:"has_subtitles"` // 字幕烧录
 	HasSidechain bool     `json:"has_sidechain"` // 侧链闪避（音乐让路人声）
 	Missing      []string `json:"missing,omitempty"`
@@ -271,7 +278,7 @@ func Detect() *Capabilities {
 		c.FFprobePath = p
 	} else {
 		c.Warnings = append(c.Warnings,
-			"未找到 ffprobe：时长探测将降级为解析 ffmpeg 输出（可用但精度略低），建议安装完整 ffmpeg 包")
+			"未找到 ffprobe：严格模式下媒体探测将直接失败（请安装完整 ffmpeg 包，含 ffprobe）")
 	}
 	if c.FFmpegPath != "" {
 		c.Version = Version()
@@ -281,16 +288,11 @@ func Detect() *Capabilities {
 		c.HasSubtitles = strings.Contains(filters, " subtitles ")
 		c.HasSidechain = strings.Contains(filters, " sidechaincompress ")
 		if !c.HasLoudnorm {
-			if c.HasEbur128 {
-				c.Warnings = append(c.Warnings,
-					"当前 ffmpeg 缺少 loudnorm 滤镜：响度归一化降级为「ebur128 测量 + 增益校正」（可用，但不做动态范围控制）。建议升级到 ffmpeg 4.1+ 以获得完整效果")
-			} else {
-				c.Warnings = append(c.Warnings,
-					"当前 ffmpeg 既无 loudnorm 也无 ebur128：无法做响度归一化，成片响度可能不达标")
-			}
+			c.Warnings = append(c.Warnings,
+				"当前 ffmpeg 缺少 loudnorm 滤镜：严格模式下响度归一化将直接失败（请升级到 ffmpeg 4.1+）")
 		}
 		if !c.HasSubtitles {
-			c.Warnings = append(c.Warnings, "当前 ffmpeg 缺少 subtitles 滤镜：字幕只能以外挂 SRT 交付")
+			c.Warnings = append(c.Warnings, "当前 ffmpeg 缺少 subtitles 滤镜：字幕无法烧录（显式 --no-burn 可只出外挂 SRT）")
 		}
 	}
 	capOnce = c
@@ -407,16 +409,13 @@ type Probe struct {
 // ProbeFile 用 ffprobe 读取媒体信息。这是"实测优先"原则的基础：
 // 任何时长都必须实测，不允许用计划值代替。
 //
-// ffprobe 缺失时降级为解析 `ffmpeg -i` 的输出：老构建/精简包常常只有 ffmpeg。
-// 降级路径精度略低，但绝不阻塞生产——并在能力自检里明确告警。
+// 严格模式：ffprobe 缺失或探测失败都直接报错，不做"解析 ffmpeg 输出"的降级——
+// 时长/编码参数的精度是下游（字幕重排、混音、质检）正确性的前提，精度不可降。
 func ProbeFile(path string) (*Probe, error) {
-	if _, err := LookPath("ffprobe"); err == nil {
-		if p, err := probeWithFFprobe(path); err == nil {
-			return p, nil
-		}
-		// ffprobe 存在但失败 → 继续尝试降级路径（可能是不支持的容器）
+	if _, err := LookPath("ffprobe"); err != nil {
+		return nil, fmt.Errorf("未找到 ffprobe：请安装完整 ffmpeg 包（含 ffprobe），或用 STUDIO_FFPROBE 指定路径")
 	}
-	return probeWithFFmpeg(path)
+	return probeWithFFprobe(path)
 }
 
 // ProbeBatch 并行探测多个媒体文件的时长，结果与输入同序。
@@ -499,50 +498,6 @@ func probeWithFFprobe(path string) (*Probe, error) {
 	}
 	if p.DurationSec <= 0 {
 		return nil, fmt.Errorf("无法探测媒体时长（文件可能损坏）: %s", path)
-	}
-	return p, nil
-}
-
-var (
-	reFmpegDur   = regexp.MustCompile(`Duration:\s*(\d+):(\d+):(\d+\.?\d*)`)
-	reFmpegVideo = regexp.MustCompile(`Video:\s*([a-zA-Z0-9_]+)`)
-	reFmpegAudio = regexp.MustCompile(`Audio:\s*([a-zA-Z0-9_]+)`)
-	reFmpegSize  = regexp.MustCompile(`,\s*(\d{2,5})x(\d{2,5})[\s,]`)
-	reFmpegFPS   = regexp.MustCompile(`(\d+\.?\d*)\s*fps`)
-)
-
-// probeWithFFmpeg 降级探测：解析 ffmpeg -i 的 stderr。
-// `ffmpeg -i` 对无输出目标的情况固定返回非零，因此这里不能按错误处理。
-func probeWithFFmpeg(path string) (*Probe, error) {
-	out, _ := Run(60*time.Second, "ffmpeg", "-hide_banner", "-i", path)
-	if strings.TrimSpace(out) == "" {
-		return nil, fmt.Errorf("无法探测媒体信息（ffmpeg 无输出）: %s", path)
-	}
-	p := &Probe{Path: path}
-	if m := reFmpegDur.FindStringSubmatch(out); len(m) == 4 {
-		var hh, mm int
-		var ss float64
-		fmt.Sscanf(m[1], "%d", &hh)
-		fmt.Sscanf(m[2], "%d", &mm)
-		fmt.Sscanf(m[3], "%f", &ss)
-		p.DurationSec = float64(hh)*3600 + float64(mm)*60 + ss
-	}
-	if m := reFmpegSize.FindStringSubmatch(out); len(m) == 3 {
-		fmt.Sscanf(m[1], "%d", &p.Width)
-		fmt.Sscanf(m[2], "%d", &p.Height)
-	}
-	if m := reFmpegFPS.FindStringSubmatch(out); len(m) == 2 {
-		fmt.Sscanf(m[1], "%f", &p.FPS)
-	}
-	if m := reFmpegVideo.FindStringSubmatch(out); len(m) == 2 {
-		p.VideoCodec = m[1]
-	}
-	if m := reFmpegAudio.FindStringSubmatch(out); len(m) == 2 {
-		p.AudioCodec = m[1]
-		p.HasAudio = true
-	}
-	if p.DurationSec <= 0 {
-		return nil, fmt.Errorf("无法解析媒体时长（文件损坏或格式不支持）: %s", path)
 	}
 	return p, nil
 }

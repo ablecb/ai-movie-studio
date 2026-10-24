@@ -6,6 +6,9 @@ import "aistudio/internal/skill"
 func RegisterAll(reg *skill.Registry) {
 	reg.Register(scriptSkill{})
 	reg.Register(charactersSkill{})
+	// 素材库阶段：分镜设计之前产出一致性素材（角色参考帧 + 场景图）——
+	// 生产顺序：场景描述 → 素材 → 分镜 → 视频 → 配音
+	reg.Register(assetsSkill{})
 	reg.Register(storyboardSkill{})
 	reg.Register(promptsSkill{})
 	reg.Register(voiceoverSkill{})

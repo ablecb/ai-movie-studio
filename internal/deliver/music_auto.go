@@ -14,6 +14,7 @@ import (
 	"aistudio/internal/audio"
 	"aistudio/internal/config"
 	"aistudio/internal/fsx"
+	"aistudio/internal/shotkit"
 )
 
 // ---------------------------------------------------------------------------
@@ -124,15 +125,18 @@ func pickMusicForCue(items []musicLibItem, mood, section, instruments string, wa
 }
 
 // ensureMusic 保证 output/music/ 里每个 cue 都有素材：曲库自动选曲 →
-// （可选）生成 API。返回需要上报的告警。
-func ensureMusic(client *ai.Client, cfg *config.Config, runDir string) []string {
+// （可选）生成 API。返回需要上报的告警（曲库缺口）与供给过程本身的错误。
+//
+// 严格模式：生成调用失败/复制失败/落盘失败都是错误（直接中止交付）；
+// "曲库无匹配素材"是缺输入不是错误——如实上报为"该 cue 无配乐"。
+func ensureMusic(client *ai.Client, cfg *config.Config, runDir string) ([]string, error) {
 	plan := loadMusicPlan(runDir)
 	if len(plan.CueSheet) == 0 {
-		return nil
+		return nil, nil
 	}
 	musicDir := filepath.Join(runDir, "output", "music")
 	if err := os.MkdirAll(musicDir, 0o755); err != nil {
-		return []string{"BGM 自动化失败（无法创建目录）: " + err.Error()}
+		return nil, fmt.Errorf("BGM 自动化失败（无法创建目录 %s）: %w", musicDir, err)
 	}
 	existing := map[string]bool{}
 	for _, f := range listAudio(musicDir) {
@@ -143,14 +147,25 @@ func ensureMusic(client *ai.Client, cfg *config.Config, runDir string) []string 
 	var warnings []string
 	var musicClient *ai.Client
 	if cfg.Music.Generate {
-		if ep := cfg.Providers.Music; ep.BaseURL != "" && ep.Model != "" && client != nil {
-			mc := client.For(ai.CapMusic, ai.Endpoint{
-				BaseURL: ep.BaseURL, APIKeyEnv: ep.APIKeyEnv,
-				APIKey: cfg.APIKeyFor(ep), Model: ep.Model,
-			})
-			if !mc.Mock() {
-				musicClient = mc
+		ep := cfg.Providers.Music
+		if cfg.Mock {
+			// 离线演示：生成走占位音频（MusicGen 的 mock 通道），不校验端点
+			if client != nil && ep.BaseURL != "" && ep.Model != "" {
+				musicClient = client.For(ai.CapMusic, ai.Endpoint{
+					BaseURL: ep.BaseURL, APIKeyEnv: ep.APIKeyEnv,
+					APIKey: cfg.APIKeyFor(ep), Model: ep.Model,
+				})
 			}
+		} else {
+			// 严格模式：开启生成就必须配置完整且可用，不允许"配了等于没配"
+			if ep.BaseURL == "" || ep.Model == "" || client == nil {
+				return nil, fmt.Errorf("music.generate=true 但 providers.music 端点未配置完整（需要 base_url 与 model）")
+			}
+			mc, err := shotkit.CapClient(client, cfg, ai.CapMusic, ep, ep.Model)
+			if err != nil {
+				return nil, err
+			}
+			musicClient = mc
 		}
 	}
 
@@ -165,27 +180,24 @@ func ensureMusic(client *ai.Client, cfg *config.Config, runDir string) []string 
 		if item, score := pickMusicForCue(lib, cue.Mood, cue.Section, cue.Instruments, cue.DurationSec); score > 0 {
 			dst := filepath.Join(musicDir, cue.ID+strings.ToLower(filepath.Ext(item.File)))
 			if err := copyFile(item.File, dst); err != nil {
-				warnings = append(warnings, fmt.Sprintf("cue %s 曲库复制失败: %v", cue.ID, err))
-				continue
+				return nil, fmt.Errorf("cue %s 曲库复制失败: %w", cue.ID, err)
 			}
 			existing[cue.ID] = true
 			fmt.Printf("  🎵 cue %s ← 曲库选曲 %s（%s）\n", cue.ID,
 				filepath.Base(item.File), cue.Mood)
 			continue
 		}
-		// 二级：生成 API（可选开关；失败只告警）
+		// 二级：生成 API（严格模式：生成失败即失败）
 		if musicClient != nil {
 			prompt := fmt.Sprintf("纯音乐，无人声。情绪：%s。节奏：%s。配器：%s。影视配乐质感。",
 				cue.Mood, cue.Tempo, cue.Instruments)
 			audioData, err := musicClient.MusicGen(prompt, int(math.Max(10, cue.DurationSec)))
 			if err != nil {
-				warnings = append(warnings, fmt.Sprintf("cue %s 音乐生成失败（该 cue 保持无配乐）: %v", cue.ID, err))
-				continue
+				return nil, fmt.Errorf("cue %s 音乐生成失败: %w", cue.ID, err)
 			}
 			dst := filepath.Join(musicDir, cue.ID+".mp3")
 			if err := fsx.AtomicWrite(dst, audioData, 0o644); err != nil {
-				warnings = append(warnings, fmt.Sprintf("cue %s 生成音频落盘失败: %v", cue.ID, err))
-				continue
+				return nil, fmt.Errorf("cue %s 生成音频落盘失败: %w", cue.ID, err)
 			}
 			existing[cue.ID] = true
 			fmt.Printf("  🎵 cue %s ← 生成（%s）\n", cue.ID, cue.Mood)
@@ -196,7 +208,7 @@ func ensureMusic(client *ai.Client, cfg *config.Config, runDir string) []string 
 				"或在 config.json 开启 music.generate 走生成 API",
 			cue.ID, cue.Mood, cfg.Music.LibraryDir, cue.Mood, cue.Instruments))
 	}
-	return warnings
+	return warnings, nil
 }
 
 // ensureSFX 音效曲库自动供给：music.json 的 sound_fx 描述与 library/sfx/

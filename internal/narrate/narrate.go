@@ -35,6 +35,7 @@ import (
 	"aistudio/internal/ffx"
 	"aistudio/internal/fsx"
 	"aistudio/internal/promspec"
+	"aistudio/internal/shotkit"
 	"aistudio/internal/subtitle"
 )
 
@@ -46,6 +47,9 @@ type Options struct {
 	Workers  int
 	// Force 强制重新合成已存在的台词音频（默认复用，避免重复付费）
 	Force bool
+	// AllowIncomplete 残缺交付（--allow-incomplete）：台本中所属镜头未渲染的
+	// 台词跳过不合成；正常交付仍视为台本与分镜不一致而失败
+	AllowIncomplete bool
 }
 
 // Line 一句台词的生成结果。
@@ -140,13 +144,14 @@ func Run(client *ai.Client, cfg *config.Config, opt Options) (*Plan, error) {
 	}
 
 	// TTS 供应商客户端：providers.tts 允许配音走另一家服务（如 MiniMax T2A v2，
-	// emotion/pitch 参数才真正生效）。For 共享同一个花费账本；
-	// 该端点没有密钥时自动退回离线模式，不会拿主密钥去请求别家。
+	// emotion/pitch 参数才真正生效）。派生客户端共享同一个花费账本。
+	// 严格模式：独立端点缺自己的密钥 → 报错——绝不允许继承主密钥去请求别家
+	// （那既会 401，也让"配了 MiniMax 却打到智谱"这类错配悄悄发生）。
 	ttsEp := cfg.Providers.TTS
-	ttsClient := client.For(ai.CapTTS, ai.Endpoint{
-		BaseURL: ttsEp.BaseURL, APIKeyEnv: ttsEp.APIKeyEnv,
-		APIKey: cfg.APIKeyFor(ttsEp), Model: ttsEp.Model,
-	})
+	ttsClient, err := shotkit.CapClient(client, cfg, ai.CapTTS, ttsEp, ttsEp.Model)
+	if err != nil {
+		return nil, err
+	}
 	ttsModel := ttsEp.Model
 	// 台本级导演说明（tts_notes）里的全局语速（如"语速 0.88x"）：
 	// 以前只写进 JSON 从不被消费。现在解析出来作为全局语速基准——
@@ -198,6 +203,9 @@ func Run(client *ai.Client, cfg *config.Config, opt Options) (*Plan, error) {
 			return nil, err // 首个错误按台本顺序返回，行为与串行版一致
 		}
 	}
+	if skipped := countNil(lines); skipped > 0 {
+		fmt.Printf("  ↷ %d 句台词所属镜头未渲染，已跳过（allow-incomplete）\n", skipped)
+	}
 
 	// 铺轨（串行，保持台本顺序——这是"台词与画面对应"的前提）
 	// J-cut 前置信息：每个镜头在片中的前一镜、哪些镜头有台词。
@@ -215,7 +223,7 @@ func Run(client *ai.Client, cfg *config.Config, opt Options) (*Plan, error) {
 	}
 	seenShot := map[string]bool{}
 	for i, line := range lines {
-		if line.MeasuredSec == 0 {
+		if line == nil || line.MeasuredSec == 0 {
 			continue // 该句没有对应镜头片段，已跳过
 		}
 		slot := slotOf[vo.Narration[i].ShotID]
@@ -257,6 +265,17 @@ func Run(client *ai.Client, cfg *config.Config, opt Options) (*Plan, error) {
 	return plan, nil
 }
 
+// countNil 统计被跳过的台词句（所属镜头未渲染，prepareLine 返回 nil）。
+func countNil(lines []*Line) int {
+	n := 0
+	for _, l := range lines {
+		if l == nil {
+			n++
+		}
+	}
+	return n
+}
+
 // prepareLine 合成并处理一句台词：TTS → 实测时长 → 合理性校验 → 变调 → 时长适配。
 // 只依赖该句自己的台本行、音色与镜头槽位，与前后句无关，可安全并行；
 // 铺轨入点（StartSec/AbsStartSec）因排麦依赖前一句的结束时间，
@@ -271,8 +290,14 @@ func prepareLine(client, ttsClient *ai.Client, ttsModel string, notesSpeed float
 
 	slot, ok := slotOf[n.ShotID]
 	if !ok {
-		fmt.Printf("  ⚠ 台词 [%s] 没有对应镜头片段，跳过\n", n.ShotID)
-		return &Line{}, nil
+		if opt.AllowIncomplete {
+			// 残缺交付：该句所属镜头未渲染——显式跳过（不合成不占轨）。
+			// 只有 --allow-incomplete 语义下才允许；正常交付仍视为数据不一致。
+			return nil, nil
+		}
+		// 严格模式：台本引用了不存在的镜头 = 数据不一致，直接失败（不静默丢台词）
+		return nil, fmt.Errorf("台词 [%s]（%s）没有对应镜头片段：台本与分镜不一致，请修正后重跑",
+			n.ShotID, truncate(n.Text, 16))
 	}
 	voice := voiceMap[voiceKey(n.Speaker)]
 	if voice == "" {
@@ -315,18 +340,15 @@ func prepareLine(client, ttsClient *ai.Client, ttsModel string, notesSpeed float
 			Voice: voice,
 			// 服务端语速是"说话人真的这么说"，比后期拉伸自然；
 			// 本地 atempo 只做超槽兜底。
-			Speed:          speed,
-			Model:          ttsModel,
-			FallbackModels: cfg.Audio.TTSFallbackModels,
-			Emotion:        emotion,
+			Speed:   speed,
+			Model:   ttsModel,
+			Emotion: emotion,
 		})
 		if err != nil {
-			// 规范化后无可朗读内容（整句只有舞台提示）跳过该句，
-			// 不让一句废台词中断整个配音流程
+			// 严格模式：无朗读文本的台词直接失败（不静默丢台词）——修正台本后重跑
 			if errors.Is(err, ai.ErrEmptyTTSText) {
-				fmt.Printf("  ⚠ [%s] %s 台词无可朗读文本，跳过：%s\n",
+				return nil, fmt.Errorf("台词 [%s] %s 无可朗读文本（整句只有符号/舞台提示）: %s",
 					n.ShotID, n.Speaker, truncate(n.Text, 20))
-				return &Line{}, nil
 			}
 			return nil, fmt.Errorf("TTS 失败 [%s %s]: %w", n.ShotID, n.Speaker, err)
 		}

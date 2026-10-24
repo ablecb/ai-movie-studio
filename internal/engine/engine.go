@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"aistudio/internal/ai"
+	"aistudio/internal/config"
 	"aistudio/internal/fsx"
 	"aistudio/internal/selfheal"
 	"aistudio/internal/skill"
@@ -159,6 +160,7 @@ type Engine struct {
 	Dir    string // runs/<id>
 	// DrillFault 故障演练：注入一次模拟错误，完整演练"重试→AI 诊断→修复重试"路径
 	DrillFault bool
+	cfg        *config.Config // 生产参数（媒体生成/质检等技能需要；纯 LLM 阶段不依赖）
 	wf         *Workflow
 	feedback   map[string]string // 阶段 ID → 审片返修意见
 	mu         sync.Mutex        // 保护并发波次下的状态修改 / 落盘 / 日志交错
@@ -171,7 +173,7 @@ func buildRegistry() *skill.Registry {
 }
 
 // NewRun 创建新运行
-func NewRun(wf *Workflow, client *ai.Client, mem *selfheal.Memory, runsRoot string) (*Engine, error) {
+func NewRun(wf *Workflow, client *ai.Client, cfg *config.Config, mem *selfheal.Memory, runsRoot string) (*Engine, error) {
 	id := "run-" + time.Now().Format("20060102-150405") + "-" + randHex(4)
 	dir := filepath.Join(runsRoot, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -187,13 +189,13 @@ func NewRun(wf *Workflow, client *ai.Client, mem *selfheal.Memory, runsRoot stri
 		st.StageOrder = append(st.StageOrder, s.ID)
 	}
 	return &Engine{Reg: buildRegistry(), Client: client, Memory: mem,
-		State: st, Dir: dir, wf: wf, feedback: map[string]string{}}, nil
+		State: st, Dir: dir, cfg: cfg, wf: wf, feedback: map[string]string{}}, nil
 }
 
 // Resume 恢复已有运行（断点续跑）。中断的 running、被跳过的 skipped、已失败的 failed
 // 阶段都会重跑——resume 的语义是"处理完问题后重来"，doctor 修复后重跑失败/跳过阶段
 // 正是主路径（失败提示与 doctor 的指引都指向 resume）。
-func Resume(dir string, wf *Workflow, client *ai.Client, mem *selfheal.Memory) (*Engine, error) {
+func Resume(dir string, wf *Workflow, client *ai.Client, cfg *config.Config, mem *selfheal.Memory) (*Engine, error) {
 	data, err := os.ReadFile(filepath.Join(dir, "state.json"))
 	if err != nil {
 		return nil, err
@@ -217,13 +219,104 @@ func Resume(dir string, wf *Workflow, client *ai.Client, mem *selfheal.Memory) (
 			st.Stages[s.ID] = &StageState{Status: StatusPending}
 		}
 	}
-	if len(st.StageOrder) == 0 {
+	// 阶段清单以工作流为准向上修复：until 截断创建的 run 或旧版本 state 可能
+	// 只记录了部分阶段，导致控制台"工作流阶段"面板看不到后面的阶段
+	// （各阶段状态都在 map 里，这里只修顺序清单，状态不丢）
+	if len(wf.Stages) > len(st.StageOrder) {
+		st.StageOrder = st.StageOrder[:0]
 		for _, s := range wf.Stages {
 			st.StageOrder = append(st.StageOrder, s.ID)
 		}
 	}
 	return &Engine{Reg: buildRegistry(), Client: client, Memory: mem,
-		State: &st, Dir: dir, wf: wf, feedback: map[string]string{}}, nil
+		State: &st, Dir: dir, cfg: cfg, wf: wf, feedback: map[string]string{}}, nil
+}
+
+// RerunFrom 重跑某阶段及其下游（人工定点重做的统一入口，Web 流程图与 CLI --from 共用）。
+//
+// 三个集合的处理各不相同：
+//   - stageID 本身：重置为待执行（Revisions 清零——手工重做给一次新的返修预算）
+//   - 下游 × 本次运行窗口内（untilID 为空=全部；否则工作流顺序 ≤ untilID 的部分）：
+//     重置为待执行，本次会话就会真的重跑
+//   - 下游 × 窗口外（--until 截断掉的）：已完成的重置为 skipped 并注明
+//     "上游已重跑、产物可能过期"——下次 resume 自动重做
+//
+// 为什么窗口外不保持 done：上游产物变了，下游产物就是过期的。保持 done 会让
+// 控制台与审片流程把过期产物当新结果——这是最贵的谎：看起来一切完成，
+// 成片却对不上刚改的上游。skipped 是引擎既有的"需要重做"语义（resume 时
+// 自动翻回 pending），不需要新状态种类，级联规则也天然一致。
+func (e *Engine) RerunFrom(stageID, untilID string) error {
+	idxOf := func(id string) int {
+		for i := range e.wf.Stages {
+			if e.wf.Stages[i].ID == id {
+				return i
+			}
+		}
+		return -1
+	}
+	startIdx := idxOf(stageID)
+	if startIdx < 0 {
+		var ids []string
+		for i := range e.wf.Stages {
+			ids = append(ids, e.wf.Stages[i].ID)
+		}
+		return fmt.Errorf("阶段 %q 不在工作流中（可选: %s）", stageID, strings.Join(ids, ", "))
+	}
+	windowEnd := len(e.wf.Stages) - 1 // 默认：窗口到工作流末尾（不截断）
+	if untilID != "" {
+		if u := idxOf(untilID); u >= 0 {
+			windowEnd = u
+		}
+	}
+
+	// 下游闭包（含自身）：沿 depends_on 反向传播
+	affected := map[string]bool{stageID: true}
+	for changed := true; changed; {
+		changed = false
+		for i := range e.wf.Stages {
+			s := &e.wf.Stages[i]
+			if affected[s.ID] {
+				continue
+			}
+			for _, d := range s.DependsOn {
+				if affected[d] {
+					affected[s.ID] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for id := range affected {
+		st := e.State.Stages[id]
+		if st == nil {
+			continue
+		}
+		idx := idxOf(id)
+		if id == stageID {
+			st.Status = StatusPending
+			st.Revisions = 0
+			st.Error = ""
+			st.RepairNote = ""
+			continue
+		}
+		if idx >= 0 && idx <= windowEnd {
+			// 本次运行窗口内：直接排队重跑
+			st.Status = StatusPending
+			st.Error = ""
+			st.RepairNote = ""
+			continue
+		}
+		if st.Status == StatusDone {
+			st.Status = StatusSkipped
+			st.RepairNote = fmt.Sprintf("上游 %s 已重跑，本阶段产物可能过期（续跑将自动重做）", stageID)
+		}
+	}
+	e.saveLocked()
+	return nil
 }
 
 // ---- 执行 ----
@@ -483,16 +576,9 @@ func (e *Engine) runStage(s *Stage, st *StageState) error {
 			switch plan.Action {
 			case "abort":
 				goto exhausted
-			case "skip":
-				e.mu.Lock()
-				st.Status = StatusSkipped
-				st.RepairNote = plan.RootCause
-				st.DurationMS = time.Since(start).Milliseconds()
-				e.saveLocked()
-				e.mu.Unlock()
-				e.logf("  ⤼ 跳过该阶段")
-				return nil
 			default: // retry
+				// 严格模式：失败阶段只有"修复重试"或"中止"两条路，
+				// 不存在被自我修复机制静默跳过的阶段
 				if wait := backoffFor(err.Error(), attempt); wait > 0 {
 					e.logf("  ⏳ 退避 %v 后重试", wait)
 					time.Sleep(wait)
@@ -602,6 +688,7 @@ func (e *Engine) execSkill(sk skill.Skill, s *Stage, st *StageState) (any, error
 		Params:  params,
 		Deps:    deps,
 		AI:      e.Client,
+		Cfg:     e.cfg,
 		Lessons: e.Memory.Recall(sk.Name(), 5),
 		Log:     e.logf,
 	}

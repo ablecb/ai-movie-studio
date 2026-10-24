@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -238,13 +239,15 @@ func (c *Client) TotalSpend() float64 { return c.ledger.totalCNY() }
 
 // EstimateVideoCost 渲染前成本预估：视频按秒、出图按张、TTS 按字符、LLM 按经验值。
 // 预估值必须**在付费调用之前**给出，这是用户决定"要不要跑"的唯一依据。
-func (c *Client) EstimateVideoCost(shots int, totalSec float64, ttsChars int, llmCalls int) CostEstimate {
+// endAnchors 是尾帧锚点的额外张数（video.end_frame_anchor 开启时每镜一张，
+// 上限为镜头数——走参考图生视频的镜头会跳过）。
+func (c *Client) EstimateVideoCost(shots int, totalSec float64, ttsChars int, llmCalls int, endAnchors int) CostEstimate {
 	est := CostEstimate{}
 	if p, ok := c.priceFor(CostVideo); ok {
 		est.VideoCNY = totalSec * p.VideoPerSec
 	}
 	if p, ok := c.priceFor(CostImage); ok {
-		est.ImageCNY = float64(shots*2) * p.ImagePerShot // 含角色参考帧
+		est.ImageCNY = float64(shots*2+endAnchors) * p.ImagePerShot // 含角色参考帧与尾帧锚点
 	}
 	if p, ok := c.priceFor(CostTTS); ok {
 		est.TTSCNY = float64(ttsChars) / 1000 * p.TTSPer1KChars
@@ -351,10 +354,15 @@ func (c *Client) settle(est float64) {
 // reservePost 带预算预留的媒体请求：预留 → 请求 → 无论成败结算预留。
 // est 为本次调用的预估花费（0 = 只做门禁检查不预留）。
 func (c *Client) reservePost(op, path string, body []byte, est float64) ([]byte, error) {
+	return c.reservePostCtx(c.Context(), op, path, body, est)
+}
+
+// reservePostCtx 同 reservePost，但使用调用方上下文（调用记录计时归位需要）。
+func (c *Client) reservePostCtx(ctx context.Context, op, path string, body []byte, est float64) ([]byte, error) {
 	if err := c.reserve(op, est); err != nil {
 		return nil, err
 	}
-	data, err := c.post(path, body)
+	data, err := c.postCtx(ctx, path, body)
 	c.settle(est)
 	return data, err
 }

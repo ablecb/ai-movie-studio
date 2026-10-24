@@ -34,46 +34,41 @@ const (
 	lumaMatchMinDelta = 2.0
 )
 
-// shotLumaOffsets 计算每个镜头的 eq 亮度校正量（无差异/测量失败 → 0）。
+// shotLumaOffsets 计算每个镜头的 eq 亮度校正量。
 // 抽每镜中点一帧缩到 320px 测量：本地 ffmpeg 调用，毫秒级，不产生付费调用。
-func shotLumaOffsets(clips []shotClip) []float64 {
+// 严格模式：任一镜头抽帧/测量失败即失败——曝光匹配是"消除镜头间闪烁"的保障，
+// 数据不全就静默整体不校，等于让成片保留"一切换就闪一下"的 AI 味。
+func shotLumaOffsets(clips []shotClip) ([]float64, error) {
 	n := len(clips)
 	if n == 0 {
-		return nil
+		return nil, nil
 	}
 	offsets := make([]float64, n)
 	tmpDir, err := os.MkdirTemp("", "studio-exposure")
 	if err != nil {
-		fmt.Printf("  ⚠ 镜头间曝光匹配跳过（临时目录创建失败）: %v\n", err)
-		return offsets
+		return nil, fmt.Errorf("曝光匹配需要临时目录: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
 	lumas := make([]float64, n)
-	valid := make([]float64, 0, n)
 	for i, c := range clips {
 		fp := filepath.Join(tmpDir, fmt.Sprintf("%s.jpg", c.ID))
 		if _, err := ffx.Run(60*time.Second, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
 			"-ss", fmt.Sprintf("%.3f", c.Dur*0.5), "-i", c.Path,
 			"-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "5", fp); err != nil {
-			continue
+			return nil, fmt.Errorf("曝光匹配抽帧失败 [%s]: %w", c.ID, err)
 		}
 		m, err := quality.AnalyzeImage(fp)
-		if err != nil || m == nil {
-			continue
+		if err != nil {
+			return nil, fmt.Errorf("曝光匹配亮度测量失败 [%s]: %w", c.ID, err)
+		}
+		if m == nil {
+			return nil, fmt.Errorf("曝光匹配亮度测量失败 [%s]: 无测量结果", c.ID)
 		}
 		lumas[i] = m.MeanLuma
-		valid = append(valid, m.MeanLuma)
 	}
-	if len(valid) < n/2 {
-		// 过半镜头测不出来（抽帧/解码异常）：数据不可信，整体放弃而不是瞎校
-		return offsets
-	}
-	median := lumaMedian(valid)
+	median := lumaMedian(lumas)
 	for i := range offsets {
-		if lumas[i] == 0 {
-			continue // 该镜测量失败：不动它
-		}
 		delta := median - lumas[i]
 		if math.Abs(delta) < lumaMatchMinDelta {
 			continue
@@ -87,7 +82,7 @@ func shotLumaOffsets(clips []shotClip) []float64 {
 		}
 		offsets[i] = off
 	}
-	return offsets
+	return offsets, nil
 }
 
 // lumaMedian 中位数：曝光基准必须抗单镜离群值（一个纯黑转场帧不能把全片拉暗）。

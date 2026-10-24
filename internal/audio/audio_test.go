@@ -220,11 +220,11 @@ func referencePeakDB(path string) float64 {
 	return 0
 }
 
-// TestNormalizeNeverSilences 回归测试：响度归一化绝不能把音频变成静音。
+// TestNormalizeTwoPassNeverSilences 回归测试：响度归一化绝不能把音频变成静音。
 //
-// 真实踩过的坑：老构建上峰值/响度测量偏差导致增益被算成 +50dB，
-// 推爆后经限幅器压成静音——"归一化把声音弄没了"。
-func TestNormalizeNeverSilences(t *testing.T) {
+// 真实踩过的坑：测量偏差导致增益被算得过大，推爆后经限幅器压成静音——
+// "归一化把声音弄没了"。两遍 loudnorm（唯一保留的归一化路径）必须带回归护栏。
+func TestNormalizeTwoPassNeverSilences(t *testing.T) {
 	if err := ffx.Preflight(); err != nil {
 		t.Skipf("环境不具备 ffmpeg 能力: %v", err)
 	}
@@ -243,8 +243,8 @@ func TestNormalizeNeverSilences(t *testing.T) {
 		t.Fatalf("测试音频本身无声: %.1f dBFS", before)
 	}
 	opt := Options{SampleRate: 24000, Channels: 2, TargetLoudness: -14, TruePeakDB: -1}
-	if err := normalizeWithGain(src, opt); err != nil {
-		t.Logf("归一化被安全护栏拒绝（可接受）: %v", err)
+	if err := normalizeTwoPass(src, opt); err != nil {
+		t.Fatalf("两遍响度归一化失败: %v", err)
 	}
 	after, aerr := PeakDBFS(src)
 	if aerr != nil {

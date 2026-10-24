@@ -113,6 +113,23 @@ func TestMergeRecordKeepsDoneOnFailure(t *testing.T) {
 	}
 }
 
+func TestMergeRecordKeepsImaged(t *testing.T) {
+	prev := ShotRecord{ID: "sh001", Status: "pending"}
+	cur := ShotRecord{
+		ID: "sh001", Status: "imaged", Image: "output/shots/sh001.png",
+		ImageMetrics: &quality.ImageVerdict{OK: true},
+		Rounds:       []RoundRecord{{Round: 0}},
+	}
+
+	merged := mergeRecord(prev, cur)
+	if merged.Status != "imaged" || merged.Image == "" {
+		t.Fatal("--images-only 的 imaged 状态与首帧路径必须落账，否则 manifest 全记 pending、镜头被误判缺失")
+	}
+	if merged.Video != "" {
+		t.Fatal("imaged 没有视频，不应写入 Video")
+	}
+}
+
 func TestVariantForCyclesBeyondList(t *testing.T) {
 	base := "cinematic shot"
 	seen := map[string]bool{}

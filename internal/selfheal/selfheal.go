@@ -1,5 +1,5 @@
 // Package selfheal 实现"自我成长 / 自我修复"机制：
-//   - Diagnose: 阶段失败后，让 AI 分析错误并给出修复动作（带修复提示重试 / 跳过 / 终止）
+//   - Diagnose: 阶段失败后，让 AI 分析错误并给出修复动作（带修复提示重试 / 终止）
 //   - Memory:   经验记忆库（memory/lessons.json），记录每次踩坑与解法，
 //     后续运行时自动把相关教训注入技能提示词 —— 引擎越用越聪明。
 package selfheal
@@ -18,7 +18,7 @@ import (
 
 // RepairAction 修复动作
 type RepairAction struct {
-	Action    string `json:"action"`     // retry | skip | abort
+	Action    string `json:"action"`     // retry | abort
 	Hint      string `json:"hint"`       // 重试时注入的修复提示
 	RootCause string `json:"root_cause"` // 根因分析（人类可读）
 }
@@ -33,12 +33,13 @@ type DiagnoseInput struct {
 
 const diagnoseSystem = `你是资深流水线工程师，负责诊断 AI 电影工作流中某个技能阶段的失败原因，并给出可执行的修复方案。
 只输出 JSON，格式：
-{"action":"retry|skip|abort","hint":"给重试时的具体修复指令，例如：输出必须是纯 JSON，禁止 markdown 代码块；字段 X 必须为字符串数组","root_cause":"一句话根因"}
+{"action":"retry|abort","hint":"给重试时的具体修复指令，例如：输出必须是纯 JSON，禁止 markdown 代码块；字段 X 必须为字符串数组","root_cause":"一句话根因"}
 规则：
 - 错误看起来是格式/解析/截断问题 → action=retry，hint 要具体到如何修正输出格式
 - 错误是缺少必要输入或依赖 → action=abort
 - 不确定时 → action=retry，hint 里给出保守修正建议
-- hint 必须可执行、具体，不要空话`
+- hint 必须可执行、具体，不要空话
+- 不存在"跳过"选项：严格模式下阶段失败只能修复重试或中止等待人工介入`
 
 // Diagnose 调用 AI 诊断失败原因，产出修复动作。mock 模式走内置规则。
 func Diagnose(client *ai.Client, in DiagnoseInput) RepairAction {
@@ -60,7 +61,7 @@ func Diagnose(client *ai.Client, in DiagnoseInput) RepairAction {
 		return RepairAction{Action: "retry", Hint: "请修正输出后重试", RootCause: "诊断器 JSON 字段不合法"}
 	}
 	switch act.Action {
-	case "retry", "skip", "abort":
+	case "retry", "abort":
 	default:
 		act.Action = "retry"
 	}

@@ -19,9 +19,16 @@
       "retries": 2
     },
     {
+      "id": "assets",
+      "skill": "assets",
+      "depends_on": ["script", "characters"],
+      "params": { "title": "素材库（一致性素材）" },
+      "retries": 1
+    },
+    {
       "id": "storyboard",
       "skill": "storyboard",
-      "depends_on": ["script", "characters"],
+      "depends_on": ["script", "characters", "assets"],
       "params": { "title": "分镜设计", "duration_min": "3" },
       "retries": 2
     },

@@ -2,6 +2,7 @@ package ai
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -84,47 +85,74 @@ type imageResp struct {
 	Error *apiError `json:"error"`
 }
 
-// ImageGenEx 文生图/参考图生图，返回图片 URL。自动按 fallback 列表降级。
-func (c *Client) ImageGenEx(prompt string, opt ImageOptions, fallbacks []string) (string, string, error) {
+// ImageGenEx 文生图/参考图生图，返回图片 URL 与实际模型。
+// 严格模式：模型由调用方按配置传入，不做任何降级（不换模型、不丢参考图）——
+// 出错即失败。
+// callName 是操作类型（业务调用名，如 assets.ref / render.shot_image），进调用记录。
+func (c *Client) ImageGenEx(callName, prompt string, opt ImageOptions) (string, string, error) {
+	span, rec, done, fail := beginCall(KindImage, callName, opt.Model)
+	rec.Mock = c.cfg.Mock
+	rec.Request = &CallRequest{
+		Prompt: truncateCall(prompt), Size: opt.Size, Quality: opt.Quality,
+		RefImages: boolToInt(opt.RefImage != ""),
+	}
+	addRequestImage(rec, "ref_image", opt.RefImage)
+	finish := func(url, model string, err error) (string, string, error) {
+		if err != nil {
+			fail(err)
+			return "", "", err
+		}
+		done(&CallResponse{URL: url, Model: model})
+		return url, model, nil
+	}
 	if c.cfg.Mock {
-		return "mock://image", opt.Model, nil
+		return finish("mock://image", opt.Model, nil)
 	}
 	if opt.Size == "" {
 		opt.Size = "1280x720"
 	}
-	models := withFallback(opt.Model, fallbacks)
-	var lastErr error
-	for _, m := range models {
-		body := imageBody(prompt, opt, opt.RefImage, m)
-		data, err := c.reservePost("images.generations", "/images/generations", body, c.estImageCost())
-		if err != nil {
-			lastErr = err
-			// 不支持参考图的错误 → 去掉参考图重试同一模型（降级而非失败）
-			if opt.RefImage != "" && isRefUnsupported(err) {
-				body2 := imageBody(prompt, opt, "", m)
-				if data2, err2 := c.reservePost("images.generations", "/images/generations", body2, c.estImageCost()); err2 == nil {
-					if url := parseImageURL(data2); url != "" {
-						c.chargeImage()
-						return url, m, nil
-					}
-				}
-				lastErr = fmt.Errorf("模型 %s 不支持参考图，已降级为纯提示词出图", m)
-			}
-			if IsFatal(err) || isModelUnavailable(err) {
-				continue // 换下一个模型
-			}
-			continue
-		}
-		if url := parseImageURL(data); url != "" {
-			c.chargeImage()
-			return url, m, nil
-		}
-		lastErr = fmt.Errorf("模型 %s 返回空图像结果", m)
+	ctx := span.ctx(c.Context())
+	m := opt.Model
+	if m == "" {
+		return finish("", "", fmt.Errorf("出图缺少模型名（配置 image.model）"))
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("没有可用的出图模型")
+	// 按端点选请求体与路径：火山方舟（Seedream）与智谱（GLM-Image/CogView）都不同
+	imgPath := "/images/generations"
+	var body []byte
+	if isArkEndpoint(c.cfg.BaseURL) {
+		body = arkImageBody(prompt, opt, opt.RefImage, m)
+		imgPath = arkAPIPath(c.cfg.BaseURL, "/images/generations")
+	} else {
+		body = imageBody(prompt, opt, opt.RefImage, m)
 	}
-	return "", "", lastErr
+	data, err := c.reservePostCtx(ctx, "images.generations", imgPath, body, c.estImageCost())
+	if err != nil {
+		// 严格模式：任何错误（含"模型不支持参考图"）都原样上抛。
+		// 去掉参考图重试会静默丢掉角色一致性的图像级约束，绝不允许。
+		// 方舟的"模型未开通"补一条可执行提示（英文报错不说明控制台缺哪步）。
+		if isArkEndpoint(c.cfg.BaseURL) {
+			err = arkModelHint(err)
+		}
+		return finish("", "", err)
+	}
+	if url := parseImageURL(data); url != "" {
+		c.chargeImage()
+		return finish(url, m, nil)
+	}
+	return finish("", "", fmt.Errorf("模型 %s 返回空图像结果", m))
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// ImageGen 兼容旧签名：文生图，固定尺寸。默认不加水印（交付物不能带角标）。
+func (c *Client) ImageGen(prompt, size string) (string, error) {
+	url, _, err := c.ImageGenEx("image.gen", prompt, ImageOptions{Model: "cogview-4", Size: size})
+	return url, err
 }
 
 // ExportImageBody 供测试断言"实际发出去的请求体"，无需起 HTTP 服务。
@@ -135,12 +163,6 @@ func ExportImageBody(prompt string, opt ImageOptions, refImage, model string) []
 // ExportVideoBody 同上，用于视频请求。
 func ExportVideoBody(prompt, imageRef string, opt VideoOptions, model string) []byte {
 	return videoBody(prompt, imageRef, opt, model)
-}
-
-// ImageGen 兼容旧签名：文生图，固定尺寸。默认不加水印（交付物不能带角标）。
-func (c *Client) ImageGen(prompt, size string) (string, error) {
-	url, _, err := c.ImageGenEx(prompt, ImageOptions{Model: "cogview-4", Size: size}, nil)
-	return url, err
 }
 
 // chargeImage 出图计费。
@@ -163,34 +185,6 @@ func parseImageURL(data []byte) string {
 	return ir.Data[0].URL
 }
 
-// isRefUnsupported 判断错误是否属于"该接口不支持参考图/图生图"。
-// 必须是"参数不认识/不支持"级别的证据才允许降级：单独的 "image" 一词太宽——
-// 图片接口的任何报错（尺寸、内容审核、5xx 正文）几乎都含这个词，误判的代价是
-// 悄悄丢掉参考图再做一次付费调用，跨镜头角色一致性随之失效。
-func isRefUnsupported(err error) bool {
-	low := strings.ToLower(err.Error())
-	// 参数名级命中：服务端明确不认识该参数
-	if containsAny(low, "image_url", "img2img", "reference_image", "参考图") {
-		return true
-	}
-	// 组合命中："不支持/未知参数" + 图类词
-	for _, kw := range []string{"not support", "unsupported", "unknown parameter", "invalid parameter", "unexpected field"} {
-		if strings.Contains(low, kw) && containsAny(low, "image", "ref") {
-			return true
-		}
-	}
-	return false
-}
-
-// isModelUnavailable 判断错误是否属于"模型不可用"，用于 fallback 判定。
-func isModelUnavailable(err error) bool {
-	var ae *APIError
-	if !asAPIError(err, &ae) {
-		return false
-	}
-	return ae.Kind == KindUnsupported || ae.StatusCode == 404
-}
-
 func asAPIError(err error, target **APIError) bool {
 	for err != nil {
 		if ae, ok := err.(*APIError); ok {
@@ -205,26 +199,6 @@ func asAPIError(err error, target **APIError) bool {
 		err = u.Unwrap()
 	}
 	return false
-}
-
-func withFallback(primary string, fallbacks []string) []string {
-	var out []string
-	seen := map[string]bool{}
-	add := func(m string) {
-		m = strings.TrimSpace(m)
-		if m != "" && !seen[m] {
-			seen[m] = true
-			out = append(out, m)
-		}
-	}
-	add(primary)
-	for _, f := range fallbacks {
-		add(f)
-	}
-	if len(out) == 0 {
-		out = append(out, "cogview-4")
-	}
-	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +220,6 @@ type VideoOptions struct {
 	// false 表示"不要水印"：请求里会**显式**写 watermark_enabled=false。
 	// 不能靠"不传"来关——官方 spec 里该字段默认 true。
 	Watermark bool
-	Fallbacks []string
 	// RefImages 参考图列表（vidu2-reference 等参考图生视频模型用，1-3 张）。
 	// 非空且模型为 vidu 系时优先于 imageRef。
 	RefImages []string
@@ -254,6 +227,9 @@ type VideoOptions struct {
 	AspectRatio string
 	// MovementAmplitude 运动幅度（vidu 系参数：auto/small/medium/large）。
 	MovementAmplitude string
+	// CameraFixed 机位固定（Seedance 参数 camera_fixed）。
+	// 分镜的"固定"运镜必须真的钉住机位——否则模型会自作主张推拉摇移。
+	CameraFixed bool
 	// EndImage 尾帧（data URL 或 URL）。与 imageRef（首帧）一起构成
 	// **首尾帧数组**：CogVideoX-3 的 image_url 接受两张图，第一张为首帧、
 	// 第二张为尾帧——链式衔接的官方能力（首帧承接上镜末帧，尾帧锚定
@@ -330,57 +306,68 @@ func videoBody(prompt, imageRef string, opt VideoOptions, model string) []byte {
 }
 
 // VideoGen 提交图生视频任务并等待完成，返回视频 URL。
+// callName 是操作类型（业务调用名，如 render.shot_video），进调用记录；
 // imageRef 可以是图片 URL 或 base64——两者都支持，避免把大图 base64 后超长。
 //
-// 首尾帧数组（EndImage 非空）不是所有降级模型都支持：整轮模型都失败且错误
-// 非致命（余额/鉴权类）时，自动去掉尾帧以单首帧重试一轮——衔接控制是增强项，
-// 不能因为它不被某个 fallback 模型支持就把镜头卡死。
-func (c *Client) VideoGen(prompt, imageRef string, opt VideoOptions) (string, error) {
+// 严格模式：不做任何降级。模型不支持首尾帧数组就直接失败（上层决定重试或中止），
+// 静默丢掉尾帧会把"运动终点被钉在分镜构图上"的衔接保障悄悄拿掉。
+func (c *Client) VideoGen(callName, prompt, imageRef string, opt VideoOptions) (string, error) {
+	span, rec, done, fail := beginCall(KindVideo, callName, opt.Model)
+	rec.Mock = c.cfg.Mock
+	rec.Request = &CallRequest{
+		Prompt: truncateCall(prompt), Size: opt.Size, Quality: opt.Quality,
+		DurationSec: opt.Duration, RefImages: len(opt.RefImages),
+		// 首帧是否随请求发出必须显式可查：图生视频与纯文生视频的一致性天差地别，
+		// 排查衔接问题的第一问就是"这次调用到底带没带图"
+		FirstFrame: firstFrameLog(imageRef), EndImage: opt.EndImage != "",
+	}
+	// 请求侧图片存档：详情页回看"当时喂给模型的就是这几张"
+	addRequestImage(rec, "first_frame", imageRef)
+	addRequestImage(rec, "end_frame", opt.EndImage)
+	finish := func(url string, err error) (string, error) {
+		if err != nil {
+			fail(err)
+			return "", err
+		}
+		done(&CallResponse{URL: url, Model: opt.Model})
+		return url, nil
+	}
 	if c.cfg.Mock {
-		return "mock://video", nil
+		return finish("mock://video", nil)
 	}
-	url, err := c.videoGenOnce(prompt, imageRef, opt)
-	if err != nil && opt.EndImage != "" && !IsFatal(err) {
-		opt.EndImage = ""
-		return c.videoGenOnce(prompt, imageRef, opt)
-	}
-	return url, err
+	ctx := span.ctx(c.Context())
+	url, err := c.videoGenOnce(ctx, prompt, imageRef, opt)
+	return finish(url, err)
 }
 
-func (c *Client) videoGenOnce(prompt, imageRef string, opt VideoOptions) (string, error) {
+func (c *Client) videoGenOnce(ctx context.Context, prompt, imageRef string, opt VideoOptions) (string, error) {
 	if opt.Timeout <= 0 {
 		opt.Timeout = 20 * time.Minute
 	}
-	models := withFallback(opt.Model, opt.Fallbacks)
-	var lastErr error
-	for _, m := range models {
-		// 预算预留包住整个尝试（提交 + 轮询）：提交成功到按实测秒数过账之间
-		// 可能隔几分钟，不预留的话并发 worker 会在"还没记账"的窗口里集体过闸
-		if err := c.reserve("videos.generations", c.estVideoCost(float64(opt.Duration))); err != nil {
-			return "", err
-		}
-		url, err := c.videoModelAttempt(prompt, imageRef, opt, m)
-		c.settle(c.estVideoCost(float64(opt.Duration)))
-		if err != nil {
-			lastErr = err
-			if IsFatal(err) {
-				return "", err // 余额/鉴权问题：立即上抛，整批熔断
-			}
-			continue
-		}
-		return url, nil
+	m := opt.Model
+	if m == "" {
+		return "", fmt.Errorf("视频生成缺少模型名（配置 video.model）")
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("没有可用的视频模型")
+	// 预算预留包住整个尝试（提交 + 轮询）：提交成功到按实测秒数过账之间
+	// 可能隔几分钟，不预留的话并发 worker 会在"还没记账"的窗口里集体过闸
+	if err := c.reserve("videos.generations", c.estVideoCost(float64(opt.Duration))); err != nil {
+		return "", err
 	}
-	return "", lastErr
+	url, err := c.videoModelAttempt(ctx, prompt, imageRef, opt, m)
+	c.settle(c.estVideoCost(float64(opt.Duration)))
+	return url, err
 }
 
 // videoModelAttempt 单模型尝试：提交任务 → 轮询到完成。
 // 预算预留由调用方（videoGenOnce）包住整个尝试。
-func (c *Client) videoModelAttempt(prompt, imageRef string, opt VideoOptions, m string) (string, error) {
+func (c *Client) videoModelAttempt(ctx context.Context, prompt, imageRef string, opt VideoOptions, m string) (string, error) {
+	// 按端点选协议：火山方舟（Seedance）走 /api/v3/contents/generations/tasks 异步任务；
+	// 智谱（CogVideoX）走 /videos/generations + /async-result 轮询
+	if isArkEndpoint(c.cfg.BaseURL) {
+		return c.arkVideoModelAttempt(ctx, prompt, imageRef, opt, m)
+	}
 	body := videoBody(prompt, imageRef, opt, m)
-	data, err := c.post("/videos/generations", body)
+	data, err := c.postCtx(ctx, "/videos/generations", body)
 	if err != nil {
 		return "", err
 	}
@@ -391,7 +378,7 @@ func (c *Client) videoModelAttempt(prompt, imageRef string, opt VideoOptions, m 
 	if tr.ID == "" {
 		return "", fmt.Errorf("视频任务提交失败: %s", truncateForLog(data))
 	}
-	return c.VideoWait(tr.ID, opt.Timeout, nil)
+	return c.VideoWaitCtx(ctx, tr.ID, opt.Timeout, nil)
 }
 
 // VideoSubmit 提交任务返回任务 ID（兼容接口）。
@@ -412,16 +399,22 @@ func (c *Client) VideoSubmit(prompt, imageB64, quality, size string, fps int) (s
 }
 
 // VideoWait 轮询视频任务直至成功/失败，返回视频 URL。
+// VideoWait 轮询视频任务直至成功/失败（使用客户端批次上下文）。
 func (c *Client) VideoWait(taskID string, timeout time.Duration, logf func(string, ...any)) (string, error) {
+	return c.VideoWaitCtx(c.Context(), taskID, timeout, logf)
+}
+
+// VideoWaitCtx 同 VideoWait，但使用调用方上下文（调用记录的首字节归位需要）。
+func (c *Client) VideoWaitCtx(ctx context.Context, taskID string, timeout time.Duration, logf func(string, ...any)) (string, error) {
 	deadline := time.Now().Add(timeout)
 	interval := 10 * time.Second
 	for time.Now().Before(deadline) {
 		select {
-		case <-c.Context().Done():
+		case <-ctx.Done():
 			return "", &APIError{Kind: KindTimeout, Op: "videos.wait", Message: "批次已取消"}
 		case <-time.After(interval):
 		}
-		data, err := c.get("/async-result/" + taskID)
+		data, err := c.getCtx(ctx, "/async-result/"+taskID)
 		if err != nil {
 			// 轮询期间的网络抖动不应直接判失败（任务仍在服务端跑），累计若干次才放弃
 			if isTransient(err) {
@@ -522,12 +515,9 @@ type ttsReq struct {
 // ttsMaxInputChars glm-tts 的单次合成上限（官方文档 1024 字符）。
 const ttsMaxInputChars = 1000
 
-// 默认模型与降级链：glm-tts 是新一代语音大模型（按上下文预判情绪与语调），
-// 自然度明显优于初代 cogtts；cogtts 保留为降级项，防服务端下线旧名。
-const (
-	defaultTTSModel  = "glm-tts"
-	fallbackTTSModel = "cogtts"
-)
+// 默认 TTS 模型：glm-tts 是新一代语音大模型（按上下文预判情绪与语调），
+// 自然度明显优于初代 cogtts。
+const defaultTTSModel = "glm-tts"
 
 // TTSOptions TTS 调用参数（与 Image/Video 一致：模型由调用方按配置传入）。
 type TTSOptions struct {
@@ -536,8 +526,6 @@ type TTSOptions struct {
 	Speed float64
 	// Model 合成模型；空则用 defaultTTSModel。
 	Model string
-	// FallbackModels 模型降级链（仅"模型不存在/不支持"时逐个重试）。
-	FallbackModels []string
 	// Emotion 情绪标注（台本 emotion 字段原样传入）。
 	// glm-tts 无该参数（忽略）；MiniMax 等支持情感枚举的供应商会映射后真正生效。
 	Emotion string
@@ -563,8 +551,7 @@ func (c *Client) TTSWithSpeed(text, voice string, speed float64) ([]byte, error)
 //
 // "机器音"的三个主要来源都在这一层处理：
 //  1. 模型：语音自然度首先由模型决定。glm-tts（新一代语音大模型，能按上下文
-//     预判情绪与语调）明显优于初代 cogtts，因此默认走 glm-tts，
-//     模型不可用时按降级链逐个重试
+//     预判情绪与语调）明显优于初代 cogtts，因此默认走 glm-tts
 //  2. 文本：TTS 的停顿、重音、语调完全跟着标点走（见 normalizeTTSText）
 //  3. 语速：服务端语速是"说话人真的这么说"，远比后期 atempo 拉伸自然；
 //     本地 atempo 只应作为超槽兜底
@@ -595,44 +582,26 @@ func (c *Client) TTSWith(text string, opt TTSOptions) ([]byte, error) {
 	if math.Abs(speed-1.0) < 0.01 {
 		speed = 0 // 1.0 就是服务端默认，不必显式传参
 	}
-	models := append([]string{opt.Model}, opt.FallbackModels...)
-	if opt.Model == "" {
-		models[0] = defaultTTSModel
-		if len(models) == 1 {
-			models = append(models, fallbackTTSModel)
-		}
+	model := opt.Model
+	if model == "" {
+		model = defaultTTSModel
 	}
-	var lastErr error
-	for _, model := range models {
-		if model == "" {
-			continue
-		}
-		body, _ := json.Marshal(ttsReq{
-			Model: model, Input: text, Voice: voice,
-			ResponseFormat: "wav", Speed: speed,
-		})
-		data, err := c.reservePost("audio.speech", "/audio/speech", body, c.estTTSCost(len([]rune(text))))
-		if err == nil {
-			if len(data) < 100 {
-				return nil, fmt.Errorf("TTS 返回异常（%d 字节），疑似失败响应", len(data))
-			}
-			p, ok := c.priceFor(CostTTS)
-			if ok {
-				c.recordMedia(CostTTS, float64(len([]rune(text))), float64(len([]rune(text)))/1000*p.TTSPer1KChars)
-			}
-			return data, nil
-		}
-		lastErr = err
-		// 只有"模型不存在/不支持"才值得换模型重试；鉴权、余额、限流换了也一样
-		var ae *APIError
-		if !errors.As(err, &ae) || ae.Kind != KindUnsupported {
-			return nil, err
-		}
+	body, _ := json.Marshal(ttsReq{
+		Model: model, Input: text, Voice: voice,
+		ResponseFormat: "wav", Speed: speed,
+	})
+	data, err := c.reservePost("audio.speech", "/audio/speech", body, c.estTTSCost(len([]rune(text))))
+	if err != nil {
+		return nil, err
 	}
-	if lastErr != nil {
-		return nil, lastErr
+	if len(data) < 100 {
+		return nil, fmt.Errorf("TTS 返回异常（%d 字节），疑似失败响应", len(data))
 	}
-	return nil, fmt.Errorf("没有可用的 TTS 模型")
+	p, ok := c.priceFor(CostTTS)
+	if ok {
+		c.recordMedia(CostTTS, float64(len([]rune(text))), float64(len([]rune(text)))/1000*p.TTSPer1KChars)
+	}
+	return data, nil
 }
 
 // ErrEmptyTTSText 台词规范化后没有可朗读内容（例如整句只有舞台提示）。
@@ -803,13 +772,15 @@ func encodeWAV(samples []int16, rate int) []byte {
 func mockVision(prompt string, out any) error {
 	mockVisionMu.Lock()
 	defer mockVisionMu.Unlock()
-	// 离线演示：返回"首轮有缺陷、复检通过"的结构，便于验证重渲闭环
+	// 离线演示：返回"首轮有缺陷、复检通过"的结构，便于验证重渲闭环。
+	// 四个分维度（身份/解剖/电影感/环境）也给全：维度聚合与一票否决路径
+	// 在离线链路里同样要被走到——判分口径 mock 与真实两条路必须一致。
 	payload := `{
 	  "score": 7.4, "pass": false,
 	  "shots": [
-	    {"id":"sh001","score":7.0,"pass":false,"issues":["hand appears with six fingers"],"fix":"重新生成该镜头，避免手部入画或换种子"},
-	    {"id":"sh002","score":8.6,"pass":true,"issues":[]},
-	    {"id":"sh003","score":8.2,"pass":true,"issues":[]}
+	    {"id":"sh001","score":7.0,"pass":false,"identity":6.2,"anatomy":5.8,"cinematic":7.8,"scene":6.5,"issues":["hand appears with six fingers"],"fix":"重新生成该镜头，避免手部入画或换种子"},
+	    {"id":"sh002","score":8.6,"pass":true,"identity":8.6,"anatomy":9.0,"cinematic":8.4,"scene":8.5,"issues":[]},
+	    {"id":"sh003","score":8.2,"pass":true,"identity":8.3,"anatomy":8.5,"cinematic":8.4,"scene":8.2,"issues":[]}
 	  ],
 	  "feedback":"sh001 手部畸形，需换种子重渲。"
 	}`

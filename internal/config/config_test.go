@@ -71,4 +71,12 @@ func TestDefaultConfigIsSelfConsistent(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("默认配置应通过自检: %v", err)
 	}
+	// 首尾帧锁定是默认能力：每镜视频都带尾帧锚点（分镜构图）。
+	// 默认关会让"衔接不自然"的回归悄悄发生——这里把它钉死。
+	if !cfg.Video.EndFrameAnchor {
+		t.Error("尾帧锚点应默认开启（每镜首尾帧锁定）")
+	}
+	if !cfg.Video.ChainSameScene {
+		t.Error("链式衔接应默认开启")
+	}
 }

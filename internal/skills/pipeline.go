@@ -97,7 +97,8 @@ func (scriptSkill) Run(ctx *skill.Context) (any, error) {
 1. 场景数与 brief 体量匹配（默认 3-6 场）；三幕结构清晰——第一幕建立处境与欲望，第二幕冲突升级，第三幕给变化与余味；每场标注 act（1/2/3）与 tone（本场情绪基调，如 压抑/紧张/温暖/释然）；
 2. 每场必须写 purpose（这场为什么存在），相邻两场的 purpose 不得雷同；全片至少一场有明确的 turn（转折），没有转折的剧本只是情况的罗列；情绪要有起伏——tone 最好有对比（如压抑→释放）；
 3. 台词克制、有潜台词；每个场景的 action 必须具体可分镜；
-4. time_of_day 与 action 严禁自相矛盾（例如夜场写"晨光"）；只输出 JSON。`
+4. time_of_day 与 action 严禁自相矛盾（例如夜场写"晨光"）；
+5. 画面表达走含蓄暗示路线：不要直写血腥、伤口、尸体、兵器、束缚、注射等具象负面元素（如 血迹/流淌/撕裂/勒痕），冲突与创伤用光影、道具、留白与表演来暗示——场景 action 会原样流进分镜与图像提示词，直白的负面词汇会触发生成平台内容审核拦截，整镜报废；只输出 JSON。`
 		user := "创作意图：" + ctx.Brief + "\n片长目标(分钟)：" + ctx.ParamStr("duration_min", "3") +
 			"\n风格要求：" + ctx.ParamStr("style", "由你根据 brief 决定")
 		if err := callJSON(ctx, "script", system, user, s); err != nil {
@@ -504,7 +505,7 @@ func (storyboardSkill) Run(ctx *skill.Context) (any, error) {
 		system := filmBase + `
 你是分镜师。基于剧本产出分镜表 JSON，schema：
 {"shots":[{"id":"sh001","scene_id":"s1","description":"画面内容与表演调度","shot_size":"大远景|远景|全景|中景|近景|特写|大特写","camera_move":"固定|缓推|缓拉|横移|摇|手持跟随|航拍|升降|环绕","duration_sec":4.0,"location":"地点","characters":["出场角色"]}],"total_duration_sec":总计秒数}
-专业要求：景别成组（建立镜头→反应镜头→细节镜头，同一景别不连续超过 2 镜）；镜头时长 2-8 秒（AI 视频生成友好）；场景切换有视觉过渡设计；每个场景至少 2 个镜头；把剧本里每场的 purpose/turn 落实为具体的镜头设计（转折点要给到镜头级：让谁在什么景别里完成变化）；camera_move 必须严格使用枚举值；只输出 JSON。` + shotGuidance
+专业要求：景别成组（建立镜头→反应镜头→细节镜头，同一景别不连续超过 2 镜）；镜头时长 2-8 秒（AI 视频生成友好）；场景切换有视觉过渡设计；每个场景至少 2 个镜头；把剧本里每场的 purpose/turn 落实为具体的镜头设计（转折点要给到镜头级：让谁在什么景别里完成变化）；有台词的镜头注意口型风险——AI 生成的口型与配音对不上，说台词的镜头优先用"看不见嘴"的电影语言承载：听者反应镜头、过肩、侧脸/背身、前景遮挡、手部或道具大特写、说话人出画（画外音），避免正面正对说话人嘴部的 特写/大特写；camera_move 必须严格使用枚举值；只输出 JSON。` + shotGuidance
 		user := "剧本：" + marshal(script)
 		if fb, _ := ctx.Params["revision_feedback"].(string); fb != "" {
 			user += "\n返修重点：" + fb

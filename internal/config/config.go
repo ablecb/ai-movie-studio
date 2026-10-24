@@ -49,15 +49,13 @@ type VideoGen struct {
 	QualityModel   string `json:"quality_model"`   // --quality quality 时使用的模型
 	EconomyModel   string `json:"economy_model"`   // --quality speed 时使用的模型
 	DefaultQuality string `json:"default_quality"` // speed | quality
-	Size           string `json:"size"`            // 生成分辨率（须为 16 的整数倍）
+	Size           string `json:"size"`            // 生成分辨率（智谱：16 的整数倍；火山方舟：由它推导 resolution 档位与画幅）
 	FPS            int    `json:"fps"`
 	Workers        int    `json:"workers"`
 	TimeoutMinutes int    `json:"timeout_minutes"`
 	ShotRetries    int    `json:"shot_retries"`    // 单镜头生成重试次数
 	RerenderRounds int    `json:"rerender_rounds"` // 质检不过 → 换种子重渲的最大轮数
 	WithAudio      bool   `json:"with_audio"`      // 交给模型带音频（我们自己做后期，默认关）
-	// FallbackModels：模型不可用（404/不支持）时按序降级，避免 API 升级直接打断生产
-	FallbackModels []string `json:"fallback_models"`
 	// ImageToImage：出图接口是否支持参考图（角色一致性关键能力）；不支持时自动降级
 	ImageToImage bool   `json:"image_to_image"`
 	RefSize      string `json:"ref_size"` // 角色参考图分辨率
@@ -70,9 +68,19 @@ type VideoGen struct {
 	// 首尾帧链式工作流）：镜头衔接处动作/光线/机位天然连续，硬切的跳变感消失。
 	// 场景切换的镜头仍走分镜首帧，避免跨场景"闪现"。
 	ChainSameScene bool `json:"chain_same_scene"`
-	// ReferenceModel 参考图生视频模型（如 vidu2-reference：1-3 张参考图生成
-	// 主体一致的视频）。多角色同框镜头用多张角色参考帧直接喂视频模型，
-	// 比单参考帧图生图的同框一致性好得多；留空 = 禁用该路径。
+	// EndFrameAnchor 每镜生成视频时附上"尾帧锚点"（本镜分镜构图），作为
+	// CogVideoX-3 首尾帧数组的第二张——运动的终点被钉在分镜构图上，中途不漂离。
+	// 有承接的镜头：首帧=上镜末帧、尾帧=本镜构图（首尾夹逼）；
+	// 无承接的镜头（片头/定点重渲/跨场景）：首尾两端同为分镜构图，画面锁定更稳。
+	// 代价：每镜多一次出图费（约几角钱）。参考图生视频路径（vidu）无尾帧概念，
+	// 走该路径的镜头自动跳过锚点。
+	// 严格模式：开启后锚点生成/质检失败即镜头失败（不退回单首帧）。
+	EndFrameAnchor bool `json:"end_frame_anchor"`
+	// ReferenceModel 参考图生视频模型：多角色同框镜头把多张角色参考帧直接喂
+	// 视频模型，比"单首帧 + 文字提示"的同框一致性好得多；留空 = 禁用该路径
+	// （同框一致性改由多参考图出图 providers.image_edit 保证）。
+	// 智谱端点填 vidu2-reference；火山方舟端点填支持参考图角色的 Seedance 模型
+	// （参考帧会以 role=reference_image 发送）。
 	ReferenceModel string `json:"reference_model"`
 	// Watermark 是否在生成的视频上保留平台水印。
 	//
@@ -86,10 +94,9 @@ type VideoGen struct {
 
 // ImageGen 出图参数。
 type ImageGen struct {
-	Model          string   `json:"model"`
-	FallbackModels []string `json:"fallback_models"`
-	Size           string   `json:"size"`
-	RefSize        string   `json:"ref_size"`
+	Model   string `json:"model"`
+	Size    string `json:"size"`
+	RefSize string `json:"ref_size"`
 	// Quality 出图质量档：hd | standard | 留空（沿用服务端默认）。
 	//
 	// hd 的官方描述是"更精细、整体一致性更高"——一致性正是本项目的命门；
@@ -220,9 +227,6 @@ type Audio struct {
 	// glm-tts 无 emotion 入参（能力上限，只能靠标点驱动韵律）；
 	// 支持 emotion 的供应商（如 MiniMax speech-2.6+）会真正吃到该参数。
 	TTSEmotion bool `json:"tts_emotion"`
-	// TTSFallbackModels TTS 模型降级链：主模型不可用（404/不支持）时按序重试，
-	// 避免服务商下线旧模型名直接打断配音环节。
-	TTSFallbackModels []string `json:"tts_fallback_models"`
 }
 
 // Subtitle 字幕参数。
@@ -286,6 +290,7 @@ type Config struct {
 	// RefQC 角色参考帧质检（渲染前的一致性关卡）。
 	// 参考帧是全片一致性的根：参考帧一旦与角色圣经不符（眼镜丢了、发型变了），
 	// 错误会经图生图放大到每一个出镜镜头，事后无法挽回。
+	// 严格模式：质检启用（strict）但视觉端点不可用/核对不通过 → 直接失败。
 	RefQC RefQCConfig `json:"ref_qc"`
 
 	// LocalFile 实际生效的本地覆盖层路径（"" 表示没有）。
@@ -351,7 +356,7 @@ type VisionReview struct {
 type RefQCConfig struct {
 	// Mode strict（默认）：参考帧出图后由视觉模型对照角色圣经逐项核对，
 	// 不合格自动重出（换种子 + 追加修复提示）；off：跳过核对。
-	// 无视觉密钥/探活失败时自动跳过并在日志显式说明（fail-open 但可见）。
+	// 严格模式：无视觉密钥/探活失败时拒绝开工（不允许静默跳过核对）。
 	Mode string `json:"mode"`
 	// MaxRounds 不合格重出的最大轮数（不含首次生成）。
 	MaxRounds int `json:"max_rounds"`
@@ -399,7 +404,6 @@ func Default() *Config {
 			ShotRetries:    3,
 			RerenderRounds: 2,
 			WithAudio:      false,
-			FallbackModels: []string{"cogvideox-3", "cogvideox"},
 			ImageToImage:   true,
 			RefSize:        "1024x1024",
 			Watermark:      false,
@@ -407,13 +411,14 @@ func Default() *Config {
 			AllowLongTakes: true,
 			// 同场景末帧→首帧链式衔接：官方 image_url 数组第二张即尾帧的能力前提
 			ChainSameScene: true,
+			// 每镜都带尾帧锚点（首尾帧夹逼），不再只限链式承接镜头
+			EndFrameAnchor: true,
 			// vidu2-reference：智谱平台上的参考图生视频模型（1-3 张参考图，
 			// 专为一致主体设计），多角色同框镜头的一致性显著优于单参考帧图生图
 			ReferenceModel: "vidu2-reference",
 		},
 		Image: ImageGen{
-			Model:          "glm-image",
-			FallbackModels: []string{"glm-image", "cogview-4"},
+			Model: "glm-image",
 			// glm-image 要求尺寸在 512-2048 内且为 32 的整数倍，1280x720 不合法；
 			// 1248x704 是最接近 16:9 的合规值。
 			Size:      "1248x704",
@@ -451,15 +456,14 @@ func Default() *Config {
 			SFXGainDB:     -14,
 			// 1.15 是"听不出赶"的经验上限：再高宁可让台词溢出到下一镜头
 			// （字幕跟随实测时间），也不做明显失真的加速。
-			MaxSpeedUp:        1.15,
-			LineGapSec:        0.28,
-			LeadInSec:         0.18,
-			JCutSec:           0.3,
-			CueFadeOutSec:     2.0,
-			TargetLoudness:    -14,
-			TTSSpeed:          1.0,
-			TTSFallbackModels: []string{"cogtts"},
-			TTSEmotion:        true,
+			MaxSpeedUp:     1.15,
+			LineGapSec:     0.28,
+			LeadInSec:      0.18,
+			JCutSec:        0.3,
+			CueFadeOutSec:  2.0,
+			TargetLoudness: -14,
+			TTSSpeed:       1.0,
+			TTSEmotion:     true,
 		},
 		// 转场默认全开：editplan 的 fade_in/dissolve 方案从"死数据"变成真实画面
 		Transitions: Transitions{
@@ -487,6 +491,8 @@ func Default() *Config {
 		},
 		// 视觉复核默认关闭：它需要额外的视觉模型（可能来自另一家服务商），
 		// 开启前应确认端点与模型都支持图片输入。
+		// 严格模式：一旦启用（或 --visual），复核不可用（无密钥/探活失败）即报错，
+		// 不再静默跳过——要跳过请显式 --no-visual。
 		VisionReview: VisionReview{
 			Enabled:            false,
 			SampleFrames:       3,
@@ -691,9 +697,6 @@ func (c *Config) normalize() {
 	if c.Video.QualityModel == "" {
 		c.Video.QualityModel = c.Video.Model
 	}
-	if len(c.Video.FallbackModels) == 0 {
-		c.Video.FallbackModels = d.Video.FallbackModels
-	}
 	if c.Video.RefSize == "" {
 		c.Video.RefSize = d.Video.RefSize
 	}
@@ -705,9 +708,6 @@ func (c *Config) normalize() {
 	}
 	if c.Image.RefSize == "" {
 		c.Image.RefSize = d.Image.RefSize
-	}
-	if len(c.Image.FallbackModels) == 0 {
-		c.Image.FallbackModels = d.Image.FallbackModels
 	}
 	if c.Image.Workers <= 0 {
 		c.Image.Workers = d.Image.Workers
@@ -735,9 +735,6 @@ func (c *Config) normalize() {
 	}
 	if c.Audio.TTSSpeed <= 0 {
 		c.Audio.TTSSpeed = d.Audio.TTSSpeed
-	}
-	if len(c.Audio.TTSFallbackModels) == 0 {
-		c.Audio.TTSFallbackModels = d.Audio.TTSFallbackModels
 	}
 	if c.Audio.LineGapSec < 0 {
 		c.Audio.LineGapSec = d.Audio.LineGapSec
@@ -1012,12 +1009,12 @@ func (c *Config) Validate() error {
 // String 打印生效配置摘要（启动时输出，便于生产排障）。
 func (c *Config) String() string {
 	return fmt.Sprintf(
-		"文本模型=%s 视觉复核=%s 视频=%s(%s) 出图=%s%s 水印=图:%s 视频:%s 并发=%d 单镜头重试=%d 重渲轮数=%d 预算=%s 转场=%v 链式衔接=%v 参考视频=%s",
+		"文本模型=%s 视觉复核=%s 视频=%s(%s) 出图=%s%s 水印=图:%s 视频:%s 并发=%d 单镜头重试=%d 重渲轮数=%d 预算=%s 转场=%v 链式衔接=%v 尾帧锚点=%v 参考视频=%s",
 		c.Models.Text, c.Models.Vision, c.VideoModel(c.Video.DefaultQuality), c.Video.DefaultQuality,
 		c.Image.Model, c.imageQualityText(),
 		watermarkText(c.Image.Watermark), watermarkText(c.Video.Watermark),
 		c.Video.Workers, c.Video.ShotRetries, c.Video.RerenderRounds, c.budgetText(),
-		c.Transitions.Enabled, c.Video.ChainSameScene, orDefault(c.Video.ReferenceModel, "关"))
+		c.Transitions.Enabled, c.Video.ChainSameScene, c.Video.EndFrameAnchor, orDefault(c.Video.ReferenceModel, "关"))
 }
 
 func orDefault(s, def string) string {

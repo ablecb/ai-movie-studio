@@ -8,9 +8,12 @@ import (
 	"testing"
 
 	"aistudio/internal/ai"
+	"aistudio/internal/config"
 	"aistudio/internal/selfheal"
 	"aistudio/internal/skill"
 )
+
+func testConfig() *config.Config { return config.Default() }
 
 func mockClient() *ai.Client {
 	return ai.New(ai.Config{Mock: true})
@@ -62,7 +65,7 @@ func TestResumeSeedsMissingStages(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e, err := Resume(dir, wf, mockClient(), testMemory(t))
+	e, err := Resume(dir, wf, mockClient(), testConfig(), testMemory(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +92,7 @@ func TestResumeSeedsMissingStages(t *testing.T) {
 func TestHandleReviewCorruptArtifact(t *testing.T) {
 	dir := t.TempDir()
 	wf := testWorkflow()
-	e, err := NewRun(wf, mockClient(), testMemory(t), dir)
+	e, err := NewRun(wf, mockClient(), testConfig(), testMemory(t), dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +129,7 @@ func TestHandleReviewCorruptArtifact(t *testing.T) {
 func TestHandleReviewEmptyArtifact(t *testing.T) {
 	dir := t.TempDir()
 	wf := testWorkflow()
-	e, err := NewRun(wf, mockClient(), testMemory(t), dir)
+	e, err := NewRun(wf, mockClient(), testConfig(), testMemory(t), dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +160,7 @@ func TestHandleReviewEmptyArtifact(t *testing.T) {
 func TestHandleReviewDirectsRevision(t *testing.T) {
 	dir := t.TempDir()
 	wf := testWorkflow()
-	e, err := NewRun(wf, mockClient(), testMemory(t), dir)
+	e, err := NewRun(wf, mockClient(), testConfig(), testMemory(t), dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +208,7 @@ func TestHandleReviewDirectsRevision(t *testing.T) {
 func TestRunMockWorkflowEndToEnd(t *testing.T) {
 	dir := t.TempDir()
 	wf := testWorkflow()
-	e, err := NewRun(wf, mockClient(), testMemory(t), dir)
+	e, err := NewRun(wf, mockClient(), testConfig(), testMemory(t), dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +234,7 @@ func TestRunMockWorkflowEndToEnd(t *testing.T) {
 func TestStatePersisted(t *testing.T) {
 	dir := t.TempDir()
 	wf := testWorkflow()
-	e, err := NewRun(wf, mockClient(), testMemory(t), dir)
+	e, err := NewRun(wf, mockClient(), testConfig(), testMemory(t), dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,4 +273,81 @@ func mustRead(t *testing.T, path string) []byte {
 		t.Fatal(err)
 	}
 	return data
+}
+
+// RerunFrom：全流程跑完后人工重跑某阶段。窗口内（≤until）的下游本次直接
+// 排队重跑；窗口外的已完成下游标记为"需重做"；上游与无关分支不受牵连。
+func TestRerunFromWindowSemantics(t *testing.T) {
+	dir := t.TempDir()
+	wf := testWorkflow()
+	e, err := NewRun(wf, mockClient(), testConfig(), testMemory(t), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Run(); err != nil {
+		t.Fatalf("mock 全流程不应失败: %v", err)
+	}
+	for _, s := range wf.Stages {
+		if st := e.State.Stages[s.ID]; st.Status != StatusDone {
+			t.Fatalf("前置条件：阶段 %s 应为 done，实际 %s", s.ID, st.Status)
+		}
+	}
+
+	// 场景一：重跑单阶段（from == until）——该阶段排队，下游标记需重做
+	if err := e.RerunFrom("characters", "characters"); err != nil {
+		t.Fatal(err)
+	}
+	if st := e.State.Stages["script"]; st.Status != StatusDone {
+		t.Fatalf("上游 script 不应被牵连，实际 %s", st.Status)
+	}
+	if st := e.State.Stages["characters"]; st.Status != StatusPending {
+		t.Fatalf("characters 应重置为 pending，实际 %s", st.Status)
+	}
+	for _, id := range []string{"assets", "storyboard", "voiceover", "music", "shotspec", "subtitles", "editplan", "review"} {
+		st := e.State.Stages[id]
+		if st.Status != StatusSkipped || !strings.Contains(st.RepairNote, "上游 characters 已重跑") {
+			t.Fatalf("窗口外下游 %s 应标记需重做，实际 %s / %q", id, st.Status, st.RepairNote)
+		}
+	}
+	// 单阶段重跑后 Run：只重做 characters，窗口外下游保持"需重做"等下次续跑
+	if err := e.Run(); err != nil {
+		t.Fatalf("单阶段重跑不应失败: %v", err)
+	}
+	if st := e.State.Stages["characters"]; st.Status != StatusDone {
+		t.Fatalf("characters 重跑后应为 done，实际 %s", st.Status)
+	}
+	if st := e.State.Stages["assets"]; st.Status != StatusSkipped {
+		t.Fatalf("窗口外下游本次不应被重跑，实际 %s", st.Status)
+	}
+
+	// 场景二：无 until（窗口到末尾）——下游全部排队，一次 Run 全量重做
+	if err := e.RerunFrom("characters", ""); err != nil {
+		t.Fatal(err)
+	}
+	if st := e.State.Stages["assets"]; st.Status != StatusPending {
+		t.Fatalf("窗口内下游 assets 应排队重跑，实际 %s", st.Status)
+	}
+	if err := e.Run(); err != nil {
+		t.Fatalf("全量重跑不应失败: %v", err)
+	}
+	for _, s := range wf.Stages {
+		if st := e.State.Stages[s.ID]; st.Status != StatusDone {
+			t.Fatalf("全量重跑后阶段 %s 应回到 done，实际 %s", s.ID, st.Status)
+		}
+	}
+
+	// 场景三：下游闭包不越界——重跑 music 只波及 music 与依赖它的 review，
+	// 平行分支 subtitles/editplan 保持 done
+	if err := e.RerunFrom("music", ""); err != nil {
+		t.Fatal(err)
+	}
+	if st := e.State.Stages["subtitles"]; st.Status != StatusDone {
+		t.Fatalf("无关分支 subtitles 不应被重置，实际 %s", st.Status)
+	}
+	if st := e.State.Stages["editplan"]; st.Status != StatusDone {
+		t.Fatalf("无关分支 editplan 不应被重置，实际 %s", st.Status)
+	}
+	if st := e.State.Stages["review"]; st.Status != StatusPending {
+		t.Fatalf("依赖 music 的 review 应排队重跑，实际 %s", st.Status)
+	}
 }
