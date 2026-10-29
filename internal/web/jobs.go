@@ -311,7 +311,14 @@ func (m *JobManager) buildArgs(jobType, runID string, p map[string]any) ([]strin
 	strP := func(key string) string { s, _ := get(key).(string); return strings.TrimSpace(s) }
 	floatP := func(key string) float64 { f, _ := get(key).(float64); return f }
 
-	args := []string{jobType}
+	// dub 是 UI 语义（"只管声音的 deliver"），CLI 里没有 dub 子命令——
+	// 直接把 jobType 当子命令拼会让子进程打印用法后退出（历史上首次点击
+	// 一键配音即失败的原因）。映射到 deliver，配音旗标在下方 case 里补。
+	cliSub := jobType
+	if jobType == "dub" {
+		cliSub = "deliver"
+	}
+	args := []string{cliSub}
 	add := func(kv ...string) { args = append(args, kv...) }
 	addIf := func(cond bool, kv ...string) {
 		if cond {
@@ -431,6 +438,7 @@ func (m *JobManager) buildArgs(jobType, runID string, p map[string]any) ([]strin
 		add("--run", runPath())
 		add("--allow-incomplete")
 		add("--no-visual")
+		addIf(boolP("force_dub"), "--force-dub")
 		add("--config", configArg(p))
 		return args, "一键配音 " + runID, nil
 
