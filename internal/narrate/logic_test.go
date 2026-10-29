@@ -69,8 +69,8 @@ func TestJCutLead(t *testing.T) {
 	}
 }
 
-// TestLayoutLine 排麦三规则：口型窗口锚定入点并放弃 J-cut；
-// 与上一句冲突时顶到游标之后（绝不叠音）；超槽如实标注。
+// TestLayoutLine 排麦规则：口型窗口锚定入点；与上一句冲突时顶到游标
+// 之后（绝不叠音）；超槽如实标注；声桥把窗口溢出前移且受三重约束。
 func TestLayoutLine(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Audio.LeadInSec = 0.18
@@ -80,7 +80,7 @@ func TestLayoutLine(t *testing.T) {
 	win := &mouth.Window{Start: 1.0, End: 3.0, Confidence: 0.5, Frames: 12, Speaking: 5}
 	slot := ShotSlot{ShotID: "s1", Start: 10.0, Duration: 5.0, SpeakWin: win}
 	l := &Line{MeasuredSec: 1.5}
-	cursor := layoutLine(l, slot, 0, cfg, 0.3)
+	cursor := layoutLine(l, slot, 0, cfg, 0.3, 0)
 	if l.StartSec != 1.0 || l.AbsStartSec != 11.0 {
 		t.Errorf("窗口锚定：StartSec=%v AbsStartSec=%v，want 1.0/11.0", l.StartSec, l.AbsStartSec)
 	}
@@ -92,8 +92,9 @@ func TestLayoutLine(t *testing.T) {
 	}
 
 	// 2) 排麦：入点撞上游标 → 顶到 cursor+gap，绝不叠音
+	//（音频 1.0s < 窗口 2.0s，无声桥）
 	l2 := &Line{MeasuredSec: 1.0}
-	layoutLine(l2, slot, 11.5, cfg, 0)
+	layoutLine(l2, slot, 11.5, cfg, 0, 0)
 	if l2.AbsStartSec != 11.78 {
 		t.Errorf("窗口起点 11.0 撞上游标，应顶到 11.78，got %v", l2.AbsStartSec)
 	}
@@ -101,16 +102,60 @@ func TestLayoutLine(t *testing.T) {
 	// 3) 无窗口：入点=镜头起点+铅入
 	l3 := &Line{MeasuredSec: 1.0}
 	plain := ShotSlot{ShotID: "s2", Start: 20.0, Duration: 5.0}
-	layoutLine(l3, plain, 0, cfg, 0)
+	layoutLine(l3, plain, 0, cfg, 0, 0)
 	if diff := l3.StartSec - 0.18; diff > 1e-9 || diff < -1e-9 {
 		t.Errorf("无窗口应按铅入 0.18s，got %v", l3.StartSec)
 	}
 
 	// 4) 超槽：溢出如实标注
 	l4 := &Line{MeasuredSec: 6.0}
-	layoutLine(l4, plain, 0, cfg, 0)
+	layoutLine(l4, plain, 0, cfg, 0, 0)
 	if !l4.Overflow {
 		t.Error("6s > 槽位 5s 应标记 Overflow")
+	}
+
+	// 5) 声桥：音频 5.15s >> 窗口 1.47s（窗长适配被拒的场景），前移溢出。
+	//    溢出 = 5.15-1.47 = 3.68；floor = max(0+0.28, 前镜起点 25.21) = 25.21；
+	//    原始入点 33.09 → 前移 3.68 → 29.41，越切点 0.84s（JCutSec），
+	//    声音结束点 34.56 恰好 = 窗口结束（闭嘴处）。
+	win2 := &mouth.Window{Start: 2.84, End: 4.31, Confidence: 0.5, Frames: 12, Speaking: 6}
+	slot2 := ShotSlot{ShotID: "s3", Start: 30.25, Duration: 5.04, SpeakWin: win2}
+	l5 := &Line{MeasuredSec: 5.15}
+	layoutLine(l5, slot2, 0, cfg, 0, 25.21)
+	if diff := l5.AbsStartSec - 29.41; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("声桥应前移到 29.41，got %v", l5.AbsStartSec)
+	}
+	if diff := l5.JCutSec - 0.84; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("声桥越切点应记 JCutSec=0.84，got %v", l5.JCutSec)
+	}
+	if l5.StartSec >= 0 {
+		t.Errorf("声桥越切点后 StartSec 应为负，got %v", l5.StartSec)
+	}
+
+	// 6) 声桥约束一：上一句的尾巴顶住 → 前移被钳到游标之后，绝不叠音
+	l6 := &Line{MeasuredSec: 5.15}
+	layoutLine(l6, slot2, 32.0, cfg, 0, 25.21)
+	if l6.AbsStartSec != 32.28 {
+		t.Errorf("游标 32.0 顶住时入点应为 32.28，got %v", l6.AbsStartSec)
+	}
+	if l6.JCutSec != 0 {
+		t.Errorf("未越切点应记 JCutSec=0，got %v", l6.JCutSec)
+	}
+
+	// 7) 声桥约束二：前移不越出前一镜起点
+	l7 := &Line{MeasuredSec: 5.15}
+	layoutLine(l7, slot2, 0, cfg, 0, 29.8)
+	if l7.AbsStartSec != 29.8 {
+		t.Errorf("前镜起点 29.8 顶住时入点应为 29.8，got %v", l7.AbsStartSec)
+	}
+
+	// 8) 声桥不触发：音频只比窗口略长但溢出 ≤0.05s
+	win3 := &mouth.Window{Start: 1.0, End: 3.0, Confidence: 0.5, Frames: 12, Speaking: 6}
+	slot3 := ShotSlot{ShotID: "s4", Start: 10.0, Duration: 5.0, SpeakWin: win3}
+	l8 := &Line{MeasuredSec: 2.03}
+	layoutLine(l8, slot3, 0, cfg, 0, 0)
+	if l8.AbsStartSec != 11.0 {
+		t.Errorf("溢出 ≤0.05s 不应触发声桥，got %v", l8.AbsStartSec)
 	}
 }
 

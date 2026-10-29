@@ -69,8 +69,9 @@ type Line struct {
 	RawSec      float64 `json:"raw_sec"`
 	StartSec    float64 `json:"start_sec"`     // 相对镜头起点的入点（J-cut 时为负）
 	AbsStartSec float64 `json:"abs_start_sec"` // 相对成片的入点
-	// JCutSec 该句提前于所属镜头画面的秒数（J-cut：前镜无台词时声音先入，
-	// 带着观众进下一镜）。0 = 未做 J-cut。字幕按同一提前量排版，音画字仍然同步。
+	// JCutSec 该句提前于所属镜头画面的秒数（J-cut 声桥：声音先于画面入，
+	// 带着观众进下一镜；口型声桥在台词长于张嘴区间时同样产生提前）。
+	// 0 = 未做 J-cut。字幕按同一提前量排版，音画字仍然同步。
 	JCutSec float64 `json:"jcut_sec,omitempty"`
 	// MouthWin 口型说话窗口（相对镜头起点；nil=未做口型对齐）。
 	// 写进交付报告与字幕排版依据，是"口型对齐"质检项的数据源。
@@ -267,7 +268,14 @@ func Run(client *ai.Client, cfg *config.Config, opt Options) (*Plan, error) {
 			}
 		}
 		seenShot[slot.ShotID] = true
-		cursor = layoutLine(line, slot, cursor, cfg, lead)
+		// 声桥的前移下界：不得越出前一镜起点（无前一镜/前镜未渲染则不约束）
+		prevStart := 0.0
+		if prevID, ok := prevShotOf[slot.ShotID]; ok {
+			if ps, ok := slotOf[prevID]; ok {
+				prevStart = ps.Start
+			}
+		}
+		cursor = layoutLine(line, slot, cursor, cfg, lead, prevStart)
 		plan.Lines = append(plan.Lines, *line)
 	}
 
@@ -552,7 +560,8 @@ func jcutLead(l *Line, slot, prevSlot ShotSlot, maxLead float64) float64 {
 // 入点 = 镜头起点 + 指令入点，且不与上一句重叠（排麦）；
 // 必须按台本顺序调用——上一句的结束时间决定本句的最早入点。
 // jcutLead > 0 时入点提前越出镜头起点（J-cut），被排麦顶回则放弃提前。
-func layoutLine(l *Line, slot ShotSlot, cursor float64, cfg *config.Config, jcutLead float64) float64 {
+// prevStart 为前一镜的实测起点（无前一镜传 0）：声桥前移不得越出它。
+func layoutLine(l *Line, slot ShotSlot, cursor float64, cfg *config.Config, jcutLead float64, prevStart float64) float64 {
 	rel := clamp(cfg.Audio.LeadInSec, 0, math.Max(0, slot.Duration-l.MeasuredSec))
 	abs := slot.Start + rel
 	if jcutLead > 0 {
@@ -560,15 +569,30 @@ func layoutLine(l *Line, slot ShotSlot, cursor float64, cfg *config.Config, jcut
 	}
 	// 口型窗口优先：入点=张嘴时刻。声音"等嘴"而不是嘴"等声"——
 	// 窗口来自对这段视频的检测，置信度不足时上游不填窗口，走原逻辑。
-	// 音频长于窗口时允许向后续镜头画外延续（电影常规手法），只要求
-	// 入点本身落在镜头内；因此 clamp 上界是镜头末尾而非"剩余空间"。
 	if w := slot.SpeakWin; w != nil && w.Valid() {
 		abs = slot.Start + clamp(w.Start, 0, math.Max(0, slot.Duration))
-		jcutLead = 0 // 声音已锚定在镜头内的说话区间，不再提前越切点
+		// 声桥（sound bridge）：台词比张嘴区间长、窗长适配被拒时，溢出
+		// 不该全堆在闭嘴之后（"嘴闭了声音还在"是最直白的穿帮）。把入点
+		// 前移让溢出落到窗口之前——声音先入，观众带着期待等嘴张开，
+		// 声音结束点恰好落在闭嘴处（标准 J-cut 语法）。前移量受三重约束：
+		// ≤溢出量（声音必须完整盖住窗口）、不与上一句叠音、不越出前一镜起点。
+		if overflow := l.MeasuredSec - (w.End - w.Start); overflow > 0.05 {
+			floor := cursor + cfg.Audio.LineGapSec
+			floor = math.Max(floor, prevStart)
+			if earliness := math.Min(overflow, abs-floor); earliness > 0 {
+				abs -= earliness
+			}
+		}
+		jcutLead = 0 // 下方按"入点是否越出镜头起点"重算真实提前量
 	}
 	if abs < cursor+cfg.Audio.LineGapSec {
 		abs = cursor + cfg.Audio.LineGapSec
 		jcutLead = 0 // 被上一句的尾巴顶回：放弃 J-cut，保证不叠音
+	}
+	if abs < slot.Start {
+		jcutLead = slot.Start - abs // 声音越过切点：记为该句的真实提前量（字幕同步用）
+	} else {
+		jcutLead = 0 // 入点在镜头内（声桥被排麦吸收或无 J-cut）：无需字幕提前
 	}
 	l.StartSec = abs - slot.Start
 	l.AbsStartSec = abs
