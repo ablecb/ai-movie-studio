@@ -614,6 +614,7 @@ func cmdDeliver(args []string) error {
 	runDir := fs.String("run", "", "运行目录 runs/run-xxx（必填）")
 	allowIncomplete := fs.Bool("allow-incomplete", false, "允许缺镜头出片（内部审看用，报告会标注）")
 	noBurn := fs.Bool("no-burn", false, "不烧录字幕（只出无字幕母版 + 外挂 SRT）")
+	forceDub := fs.Bool("force-dub", false, "强制重新合成全部台词音频（无视 TTS 缓存，重新付费）")
 	skipAudio := fs.Bool("skip-audio", false, "跳过配音（只验证画面）")
 	visual := fs.Bool("visual", false, "运行视觉复核（让模型看画面；需配置 vision 端点与密钥）")
 	noVisual := fs.Bool("no-visual", false, "跳过视觉复核（即使配置里已启用）")
@@ -666,7 +667,7 @@ func cmdDeliver(args []string) error {
 	}
 	burn := !*noBurn
 	_, err = deliver.Run(cfg, deliver.Options{
-		RunDir: *runDir, AllowIncomplete: *allowIncomplete,
+		RunDir: *runDir, AllowIncomplete: *allowIncomplete, ForceDub: *forceDub,
 		BurnSubtitle: &burn, KeepMaster: *keepMaster,
 		SkipAudio: *skipAudio, Workers: *workers, Client: client,
 		VisionClient: visionClient, VisualCheck: doVisual,

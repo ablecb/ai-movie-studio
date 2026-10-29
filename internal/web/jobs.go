@@ -442,6 +442,7 @@ func (m *JobManager) buildArgs(jobType, runID string, p map[string]any) ([]strin
 		addIf(boolP("allow_incomplete"), "--allow-incomplete")
 		addIf(boolP("no_burn"), "--no-burn")
 		addIf(boolP("skip_audio"), "--skip-audio")
+		addIf(boolP("force_dub"), "--force-dub")
 		addIf(boolP("visual"), "--visual")
 		addIf(boolP("no_visual"), "--no-visual")
 		if v := intP("workers"); v > 0 {

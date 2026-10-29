@@ -38,13 +38,18 @@ type Window struct {
 }
 
 // Valid 窗口是否可用于对齐。
-func (w *Window) Valid() bool { return w != nil && w.End-w.Start >= 0.4 && w.Confidence >= 0.15 }
+// 单看置信度 ≥0.15 太松：12 帧里 2 帧误判（16.7%）也能过线——那种窗多半
+// 是表情变化造成的假窗，把声音锚上去反而错位。叠加 Speaking≥3：至少 3 帧
+// 说话（25% 密度）才认可窗口；mock 模式全帧说话，天然通过。
+func (w *Window) Valid() bool {
+	return w != nil && w.End-w.Start >= 0.4 && w.Confidence >= 0.15 && w.Speaking >= 3
+}
 
 // Options 检测参数。
 type Options struct {
-	Frames int   // 抽帧数（默认 12）
-	Width  int   // 抽帧宽度（默认 480，够判嘴态即可）
-	Mock   bool  // 离线演示：返回固定窗口，不调视觉
+	Frames int  // 抽帧数（默认 12）
+	Width  int  // 抽帧宽度（默认 480，够判嘴态即可）
+	Mock   bool // 离线演示：返回固定窗口，不调视觉
 	Debug  func(string, ...any)
 }
 

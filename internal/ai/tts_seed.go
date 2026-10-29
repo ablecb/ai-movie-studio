@@ -41,6 +41,10 @@ func isSeedTTSEndpoint(baseURL string) bool {
 	return strings.Contains(u, "openspeech.bytedance.com") || strings.Contains(u, "bytedance.com")
 }
 
+// IsSeedTTSEndpoint 供外部包判断 TTS 端点是否为火山语音平台——
+// narrate 层据此决定 emotion 参数是否真正生效（2.0 代际不吃该参数）。
+func IsSeedTTSEndpoint(baseURL string) bool { return isSeedTTSEndpoint(baseURL) }
+
 // ---------------------------------------------------------------------------
 // V3 单向流式接口（新版控制台，X-Api-Key 单凭据）
 //
@@ -237,7 +241,7 @@ type seedTTSBody struct {
 	User struct {
 		UID string `json:"uid"`
 	} `json:"user"`
-	Audio seedTTSAudio `json:"audio"`
+	Audio   seedTTSAudio `json:"audio"`
 	Request struct {
 		ReqID     string `json:"reqid"`
 		Text      string `json:"text"`
@@ -338,6 +342,12 @@ func (c *Client) seedTTS(text string, opt TTSOptions) ([]byte, error) {
 	model := opt.Model
 	if model == "" {
 		model = c.cfg.Model
+	}
+	// 严格模式：appid 走 V1 接口，而 "seed-tts-2.0" 是 V3 的资源 ID 语义，
+	// V1 不支持 2.0 代际（含 *_uranus_* 音色）。带病请求会以一次难排查的
+	// 400 收场——配置矛盾当场报错，给出两条明确出路。
+	if strings.Contains(model, "2.0") {
+		return nil, fmt.Errorf("providers.tts 配置矛盾：appid 走 V1 接口，不支持 model=%q（V3 资源 ID 语义、2.0 代际）——去掉 appid 走 V3 单凭据，或把 model 改为 seed-tts-1.x", model)
 	}
 	body := seedTTSRequestBody(text, opt, appid, model)
 	data, err := c.seedPost("seed.tts", "/api/v1/tts", mustJSON(body), c.estTTSCost(len([]rune(text))))

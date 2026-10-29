@@ -39,7 +39,9 @@ type Options struct {
 	KeepMaster bool
 	// SkipAudio 跳过配音混音（只交付画面，用于快速验证画面质量）
 	SkipAudio bool
-	Workers   int
+	// ForceDub 强制重新合成全部台词音频（无视 TTS 缓存，覆写旧文件）
+	ForceDub bool
+	Workers  int
 	// Client 配音所需的 AI 客户端（--skip-audio 时可为 nil）
 	Client *ai.Client
 	// VisionClient 视觉复核客户端（已配置为视觉能力）；为 nil 时跳过视觉复核
@@ -452,6 +454,7 @@ func buildNarration(client *ai.Client, cfg *config.Config, opt Options, kit *pro
 	}
 	plan, err := narrate.Run(client, cfg, narrate.Options{
 		RunDir: opt.RunDir, Workers: opt.Workers, AllowIncomplete: opt.AllowIncomplete,
+		Force: opt.ForceDub,
 	})
 	if err != nil {
 		// 严格模式：要配音就必须配音成功——缺台本/任一环节失败都直接失败，
@@ -506,10 +509,12 @@ func buildNarration(client *ai.Client, cfg *config.Config, opt Options, kit *pro
 	}
 	plan.Loudness = res.LoudnessLUFS
 	plan.Notes = append(plan.Notes, res.Notes...)
-	_ = fsx.AtomicWriteJSON(filepath.Join(opt.RunDir, "artifacts", "narration.json"), plan)
-	// 把配乐/音效轨数记进计划：交付报告要如实反映"成片里到底有没有配乐"
+	// 把配乐/音效轨数记进计划：交付报告要如实反映"成片里到底有没有配乐"。
+	// 必须先回填再落盘——旧顺序先写 narration.json 再赋值，盘上的 JSON
+	// 永远缺 music_tracks/sfx_tracks 两个字段。
 	plan.MusicTracks = res.MusicCount
 	plan.SFXTracks = res.SFXCount
+	_ = fsx.AtomicWriteJSON(filepath.Join(opt.RunDir, "artifacts", "narration.json"), plan)
 	fmt.Printf("  🔊 混音完成：%.1f LUFS / 峰值 %.1f dBFS（人声 %d，配乐 %d，音效 %d）\n",
 		res.LoudnessLUFS, res.TruePeakDB, len(voiceTracks), len(musicTracks), len(sfxTracks))
 	return mixOut, plan, musicWarns, nil

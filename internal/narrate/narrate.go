@@ -16,6 +16,8 @@
 package narrate
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -25,6 +27,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -59,7 +62,7 @@ type Line struct {
 	Speaker     string  `json:"speaker"`
 	Text        string  `json:"text"`
 	Voice       string  `json:"voice"`
-	Emotion     string  `json:"emotion,omitempty"` // 台本情绪标注（已随合成请求传入 TTS）
+	Emotion     string  `json:"emotion,omitempty"` // 台本情绪标注（仅当 TTS 端点支持 emotion 参数时填充；不支持时为空）
 	RawFile     string  `json:"raw_file"`          // 原始 TTS 音频（相对 run 目录）
 	File        string  `json:"file"`              // 处理后的音频（相对 run 目录）
 	MeasuredSec float64 `json:"measured_sec"`      // 处理后实测时长
@@ -71,13 +74,13 @@ type Line struct {
 	JCutSec float64 `json:"jcut_sec,omitempty"`
 	// MouthWin 口型说话窗口（相对镜头起点；nil=未做口型对齐）。
 	// 写进交付报告与字幕排版依据，是"口型对齐"质检项的数据源。
-	MouthWin *mouth.Window `json:"mouth_win,omitempty"`
-	Pitch     float64 `json:"pitch"`
-	Speed     float64 `json:"speed"`
-	SlotSec   float64 `json:"slot_sec"`
-	Overflow  bool    `json:"overflow"`  // 仍未装进镜头槽（已顺延到下一镜头）
-	Truncated bool    `json:"truncated"` // 因超长被压缩到上限
-	Reused    bool    `json:"reused"`    // 断点续跑复用
+	MouthWin  *mouth.Window `json:"mouth_win,omitempty"`
+	Pitch     float64       `json:"pitch"`
+	Speed     float64       `json:"speed"`
+	SlotSec   float64       `json:"slot_sec"`
+	Overflow  bool          `json:"overflow"`  // 仍未装进镜头槽（已顺延到下一镜头）
+	Truncated bool          `json:"truncated"` // 因超长被压缩到上限
+	Reused    bool          `json:"reused"`    // 断点续跑复用
 }
 
 // Plan 配音计划（交付阶段的唯一依据）。
@@ -169,6 +172,12 @@ func Run(client *ai.Client, cfg *config.Config, opt Options) (*Plan, error) {
 		return nil, err
 	}
 	ttsModel := ttsEp.Model
+	// consumeEmotion 标记当前 TTS 端点是否真正消费 emotion 参数：
+	// MiniMax 与 seed-tts-1.x 支持；seed-tts-2.0（情绪靠上下文预测）与
+	// glm-tts 不支持。不支持时情绪标注保持为空，不发送也不声称已生效。
+	ttsBaseLower := strings.ToLower(ttsEp.BaseURL)
+	consumeEmotion := strings.Contains(ttsBaseLower, "minimax") ||
+		(ai.IsSeedTTSEndpoint(ttsEp.BaseURL) && !strings.Contains(ttsModel, "2.0"))
 	// 台本级导演说明（tts_notes）里的全局语速（如"语速 0.88x"）：
 	// 以前只写进 JSON 从不被消费。现在解析出来作为全局语速基准——
 	// 配置 tts_speed 未显式设置（=1.0）时生效，逐句 speed 仍可覆盖。
@@ -206,7 +215,7 @@ func Run(client *ai.Client, cfg *config.Config, opt Options) (*Plan, error) {
 		if failed.Load() {
 			return // 已有失败：不再派发新的付费合成（与串行版"首错即停"同向）
 		}
-		line, err := prepareLine(client, ttsClient, ttsModel, notesSpeed, cfg, opt, kit, slotOf, voiceMap, vo.Narration[i], i)
+		line, err := prepareLine(client, ttsClient, ttsModel, notesSpeed, cfg, opt, kit, slotOf, voiceMap, consumeEmotion, vo.Narration[i])
 		if err != nil {
 			errs[i] = err
 			failed.Store(true)
@@ -312,12 +321,18 @@ func alignSpeakWindows(client *ai.Client, cfg *config.Config, runDir string,
 	if plan, err := loadPlanForWindows(runDir); err == nil {
 		durOf = plan
 	}
+	var cacheMU sync.Mutex
 	conc.ForEachIdx(len(slots), 2, func(i int) {
 		s := slots[i]
 		if !need[s.ShotID] {
 			return
 		}
-		if w, ok := cache[s.ShotID]; ok {
+		// cache map 被两个 worker 并发读写，须加锁——Go map 的并发读写
+		// 会触发 "concurrent map read and map write" fatal。
+		cacheMU.Lock()
+		w, ok := cache[s.ShotID]
+		cacheMU.Unlock()
+		if ok {
 			if w.Valid() {
 				slots[i].SpeakWin = w
 			}
@@ -338,7 +353,9 @@ func alignSpeakWindows(client *ai.Client, cfg *config.Config, runDir string,
 		}
 		if w != nil && w.Valid() {
 			slots[i].SpeakWin = w
+			cacheMU.Lock()
 			cache[s.ShotID] = w
+			cacheMU.Unlock()
 			fmt.Printf("  👄 [%s] 说话窗口 %.2fs–%.2fs（置信度 %.0f%%）\n",
 				s.ShotID, w.Start, w.End, w.Confidence*100)
 		}
@@ -380,13 +397,13 @@ func countNil(lines []*Line) int {
 // ttsClient 是面向 TTS 端点的客户端（可与主客户端不同供应商）；
 // notesSpeed 为台本 tts_notes 解析出的全局语速（0=未标注）；
 // 逐句 speed 是最高优先级，其次 notes，最后配置 tts_speed。
+// consumeEmotion 标记当前 TTS 端点是否真正消费 emotion 参数。
 func prepareLine(client, ttsClient *ai.Client, ttsModel string, notesSpeed float64,
 	cfg *config.Config, opt Options, kit *promspec.Kit,
-	slotOf map[string]ShotSlot, voiceMap map[string]string, n narrationLine, idx int) (*Line, error) {
+	slotOf map[string]ShotSlot, voiceMap map[string]string, consumeEmotion bool, n narrationLine) (*Line, error) {
 
 	// 全片去旁白（audio.skip_narrator）：对白驱动的短剧风格不需要画外音。
-	// 在合成入口过滤且**保持台词索引**——缓存文件名按索引编号，过滤后
-	// 对白句照样命中已付费的缓存；plan.Lines 里也不再有旁白（字幕/混音联动）。
+	// 合成入口过滤；plan.Lines 里不再有旁白（字幕/混音联动）。
 	if cfg.Audio.SkipNarrator && promspec.IsNarrator(n.Speaker) {
 		return nil, nil
 	}
@@ -406,12 +423,6 @@ func prepareLine(client, ttsClient *ai.Client, ttsModel string, notesSpeed float
 		voice = cfg.Audio.Voice
 	}
 
-	base := fmt.Sprintf("%02d_%s", idx+1, safeName(n.ShotID))
-	rawPath := filepath.Join(opt.RunDir, "output", "audio", base+".raw.wav")
-	procPath := filepath.Join(opt.RunDir, "output", "audio", "proc", base+".wav")
-	rawRel := filepath.ToSlash(filepath.Join("output", "audio", base+".raw.wav"))
-	procRel := filepath.ToSlash(filepath.Join("output", "audio", "proc", base+".wav"))
-
 	// 语速合成优先级：逐句 speed > 台本 tts_notes > 配置 tts_speed
 	speed := cfg.Audio.TTSSpeed
 	if notesSpeed > 0 && (speed <= 0 || speed == 1.0) {
@@ -420,21 +431,32 @@ func prepareLine(client, ttsClient *ai.Client, ttsModel string, notesSpeed float
 	if n.Speed > 0 {
 		speed = n.Speed
 	}
-	// 情绪标注：以前每句的 emotion 只躺在 JSON 里，从不进 TTS 请求——
-	// 这是"人声呆板"的直接原因之一。支持情感参数的供应商（MiniMax 等）真正生效，
-	// glm-tts 忽略该参数（能力上限，靠标点韵律兜底）。
+	// 情绪标注：支持情感参数的供应商（MiniMax、seed-tts-1.0）真正生效；
+	// 端点不支持（seed-tts-2.0 代际、glm-tts）时保持为空——不发送参数，
+	// 也不在日志/narration.json 里声称情绪已被消费。
 	emotion := ""
-	if cfg.Audio.TTSEmotion {
+	if cfg.Audio.TTSEmotion && consumeEmotion {
 		emotion = n.Emotion
 	}
+
+	// 缓存键 = 镜头名 + 内容指纹（文本/音色/语速/情绪/模型）：
+	// 台本插句、调序不影响指纹；改任一合成要素则指纹变化，
+	// 旧缓存自然失效重新合成——杜绝按行序号复用导致的静默错配。
+	fp := lineFingerprint(ttsModel, n.Text, voice, speed, emotion)
+	base := fmt.Sprintf("%s_%s", safeName(n.ShotID), fp)
+	rawPath := filepath.Join(opt.RunDir, "output", "audio", base+".raw.wav")
+	procPath := filepath.Join(opt.RunDir, "output", "audio", "proc", base+".wav")
+	rawRel := filepath.ToSlash(filepath.Join("output", "audio", base+".raw.wav"))
+	procRel := filepath.ToSlash(filepath.Join("output", "audio", "proc", base+".wav"))
 
 	l := &Line{
 		ShotID: n.ShotID, Speaker: n.Speaker, Text: n.Text, Voice: voice, Emotion: emotion,
 		RawFile: rawRel, File: procRel, SlotSec: slot.Duration, Pitch: 1.0, Speed: 1.0,
 	}
 
-	// 1) 合成原始音频（断点续跑：已存在则复用，已付费的资产不重买）
-	if fsx.FileExists(rawPath) {
+	// 1) 合成原始音频（断点续跑：同指纹已存在则复用，已付费的资产不重买；
+	//    Force 为 true 时无视缓存强制重新合成，覆写旧文件）
+	if fsx.FileExists(rawPath) && !opt.Force {
 		l.Reused = true
 	} else {
 		fmt.Printf("  🎙 [%s] %s（音色 %s%s）合成中…\n", n.ShotID, n.Speaker, voice, emotionNote(emotion))
@@ -486,12 +508,10 @@ func prepareLine(client, ttsClient *ai.Client, ttsModel string, notesSpeed float
 	if slotBudget < 0.6 {
 		slotBudget = slot.Duration
 	}
-	if w := slot.SpeakWin; w != nil && w.Valid() {
-		// 窗口装得下（在加速上限内）才按窗长适配——精确对齐"张嘴到闭嘴"；
-		// 装不下就不无谓加速：起点仍对齐窗口，溢出如实标注（画外延续）。
-		if win := w.End - w.Start; l.RawSec > 0 && win/l.RawSec >= cfg.Audio.MaxSpeedUp && win > 0.6 {
-			slotBudget = win
-		}
+	// 口型窗口装得下才按窗长适配（决策抽成纯函数，回归测试钉住方向——
+	// 旧条件 win/raw >= MaxSpeedUp 方向写反，分支曾沦为空操作）
+	if budget, ok := windowFitBudget(l.RawSec, slot.SpeakWin, cfg.Audio.MaxSpeedUp); ok {
+		slotBudget = budget
 	}
 	proc, err := processToSlot(cfg, rawPath, procPath, l.Pitch, slotBudget)
 	if err != nil {
@@ -882,4 +902,33 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return string(r[:n]) + "…"
+}
+
+// lineFingerprint 台词合成要素的内容指纹：TTS 模型、文本、音色、语速、情绪。
+// 用它做缓存键而不是行序号——台本插句、调序不影响指纹；改任一影响
+// 合成结果的要素则指纹变化，旧缓存自然失效。1f 分隔符防止字段拼接歧义。
+func lineFingerprint(model, text, voice string, speed float64, emotion string) string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		model,
+		text,
+		voice,
+		strconv.FormatFloat(speed, 'f', 3, 64),
+		emotion,
+	}, "\x1f")))
+	return hex.EncodeToString(sum[:6])
+}
+
+// windowFitBudget 口型窗口的时长适配决策（纯函数便于单测）：
+// 音频比窗口长、且所需加速比 rawSec/win 在上限内 → 返回 (窗长, true)，
+// 台词压进"闭嘴前说完"；装不下 → 返回 (0, false)，起点仍对齐窗口、
+// 溢出如实标注（画外延续），不做无谓加速。
+func windowFitBudget(rawSec float64, w *mouth.Window, maxSpeedUp float64) (float64, bool) {
+	if w == nil || !w.Valid() || rawSec <= 0 {
+		return 0, false
+	}
+	win := w.End - w.Start
+	if win <= 0.6 || rawSec <= win || rawSec/win > maxSpeedUp {
+		return 0, false
+	}
+	return win, true
 }
