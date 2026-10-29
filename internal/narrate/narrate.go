@@ -129,6 +129,12 @@ func Run(client *ai.Client, cfg *config.Config, opt Options) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 台本与分镜的一致性门禁：非旁白台词的说话人必须是所属镜头的在场角色。
+	// voiceover 由 AI 产出，曾把杨戬的台词挂到猪八戒的镜头上——成片变成
+	// "这张嘴配那个人的声音"，比缺台词更穿帮。数据不一致当场报错（fail-closed）。
+	if err := validateVoiceoverSpeakers(kit, vo); err != nil {
+		return nil, err
+	}
 	slots, total, err := measureShots(opt.RunDir, kit)
 	if err != nil {
 		return nil, err
@@ -764,6 +770,43 @@ func loadVoiceover(runDir string) (*voiceoverDoc, error) {
 		return nil, fmt.Errorf("配音台本为空")
 	}
 	return &vo, nil
+}
+
+// validateVoiceoverSpeakers 台本说话人与镜头在场角色的一致性校验。
+// 角色表为空的镜头无法校验，跳过；旁白句跳过；名字做双向包含匹配，
+// 容忍"杨戬" vs "杨戬（青年）"这类同角色异写。
+func validateVoiceoverSpeakers(kit *promspec.Kit, vo *voiceoverDoc) error {
+	charOf := map[string][]string{}
+	for _, s := range kit.ShotList {
+		charOf[s.ID] = s.Characters
+	}
+	var bad []string
+	for _, n := range vo.Narration {
+		if promspec.IsNarrator(n.Speaker) {
+			continue
+		}
+		chars := charOf[n.ShotID]
+		if len(chars) == 0 || speakerInScene(n.Speaker, chars) {
+			continue
+		}
+		bad = append(bad, fmt.Sprintf("  [%s] 说话人 %q 不在镜头角色（%s）中：%s",
+			n.ShotID, n.Speaker, strings.Join(chars, "、"), truncate(n.Text, 20)))
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("配音台本与分镜不一致（说话人不在镜头在场角色中，成片会变成\"这张嘴配那个人的声音\"）：\n%s\n修正 voiceover.json 的 shot_id/speaker 对应关系后重跑",
+			strings.Join(bad, "\n"))
+	}
+	return nil
+}
+
+// speakerInScene 说话人是否在场景角色列表中（双向包含匹配）。
+func speakerInScene(speaker string, chars []string) bool {
+	for _, c := range chars {
+		if c == speaker || strings.Contains(c, speaker) || strings.Contains(speaker, c) {
+			return true
+		}
+	}
+	return false
 }
 
 func loadKit(runDir string) (*promspec.Kit, error) {

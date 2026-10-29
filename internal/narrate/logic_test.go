@@ -6,6 +6,7 @@ import (
 
 	"aistudio/internal/config"
 	"aistudio/internal/mouth"
+	"aistudio/internal/promspec"
 )
 
 // diff 浮点容差比较：时间轴运算是 64 位浮点，精确相等不可靠。
@@ -134,6 +135,42 @@ func TestWindowFitBudget(t *testing.T) {
 	bad := &mouth.Window{Start: 1.0, End: 1.3, Confidence: 0.1, Frames: 12, Speaking: 1}
 	if _, ok := windowFitBudget(2.2, bad, 1.15); ok {
 		t.Error("低质窗口（过短+低置信度）不应适配")
+	}
+}
+
+// TestValidateVoiceoverSpeakers 台本说话人 × 镜头角色的一致性门禁：
+// 错配必须报错（历史上 AI 把杨戬的台词挂到猪八戒的镜头，成片"嘴配错声"）；
+// 旁白、双向包含匹配、空角色表跳过。
+func TestValidateVoiceoverSpeakers(t *testing.T) {
+	kit := &promspec.Kit{
+		ShotList: []promspec.ShotSpec{
+			{ID: "sh007", Characters: []string{"猪八戒"}},
+			{ID: "sh005", Characters: []string{"杨戬"}},
+			{ID: "sh099"}, // 角色表为空：无法校验，跳过
+		},
+	}
+	// 错配：杨戬的台词挂在猪八戒的镜头 → 报错且信息含镜头与角色
+	swapped := &voiceoverDoc{Narration: []narrationLine{
+		{ShotID: "sh007", Speaker: "杨戬", Text: "天蓬元帅触犯天规。"},
+	}}
+	err := validateVoiceoverSpeakers(kit, swapped)
+	if err == nil {
+		t.Fatal("说话人错配应报错")
+	}
+	for _, want := range []string{"sh007", "杨戬", "猪八戒"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误信息应含 %q：%v", want, err)
+		}
+	}
+	// 正确归属 + 旁白 + 异写 + 空角色表 → 通过
+	ok := &voiceoverDoc{Narration: []narrationLine{
+		{ShotID: "sh007", Speaker: "猪八戒", Text: "只记得俺贪睡好吃？"},
+		{ShotID: "sh005", Speaker: "narrator", Text: "杀意，一闪而过。"},
+		{ShotID: "sh005", Speaker: "杨戬（青年）", Text: "异写角色应包含匹配通过"},
+		{ShotID: "sh099", Speaker: "路人甲", Text: "空角色表跳过"},
+	}}
+	if err := validateVoiceoverSpeakers(kit, ok); err != nil {
+		t.Errorf("合法台本不应报错：%v", err)
 	}
 }
 
